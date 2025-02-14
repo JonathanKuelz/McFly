@@ -2,10 +2,9 @@ from abc import abstractmethod, ABC
 from typing import Optional
 
 import omni.kit.ui
-import omni.ui as ui
 
 
-class UIBuilder(ABC):
+class ExtensionUiTemplate(ABC):
     """Boilerplate code for a UI builder"""
 
     def __init__(self, window_title: str, menu_path: Optional[str] = None):

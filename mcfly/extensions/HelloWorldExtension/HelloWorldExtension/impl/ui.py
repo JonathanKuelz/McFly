@@ -1,9 +1,9 @@
 import omni.ui as ui
 
-from mcfly.extensions.templates.sim_template_ui import UIBuilder
+from mcfly.extensions.templates.extension_ui_template import ExtensionUiTemplate
 
 
-class HelloWorldUI(UIBuilder):
+class HelloWorldUI(ExtensionUiTemplate):
 
     def build_ui(self):
         """
@@ -13,4 +13,3 @@ class HelloWorldUI(UIBuilder):
             self._window = ui.Window(title=self._window_title, visible=False, width=300, height=300)
             with self._window.frame:
                 self._button = ui.Button("Click me", clicked_fn=lambda: print("Button clicked"))
-                

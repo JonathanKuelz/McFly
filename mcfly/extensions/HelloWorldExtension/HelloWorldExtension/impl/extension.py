@@ -1,24 +1,13 @@
-import carb
-import omni.ext
-import omni.kit.app
-
+from mcfly.extensions.templates.extension_template import ExtensionTemplate
 from .ui import HelloWorldUI
 
 
-class HelloWorldExtension(omni.ext.IExt):
+class HelloWorldExtension(ExtensionTemplate):
     """A minimal extension with a UI window"""
 
-    def on_startup(self, ext_id):
-        """Method called when the extension is loaded/enabled"""
-        carb.log_info(f"on_startup {ext_id}")
-        ext_path = omni.kit.app.get_app().get_extension_manager().get_extension_path(ext_id)  # noqa
+    ui_builder_ref = HelloWorldUI
 
-        # UI handler
-        self.ui_builder = HelloWorldUI(window_title="Wow, fantastic!", menu_path="Window/HelloUIExtension")
-
-    def on_shutdown(self):
-        """Method called when the extension is disabled"""
-        carb.log_info("on_shutdown")
-
-        # clean up UI
-        self.ui_builder.cleanup()
+    @property
+    def name(self) -> str:
+        """Name of the extension"""
+        return "HelloWorldExtension"
