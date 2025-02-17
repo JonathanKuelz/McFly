@@ -18,7 +18,6 @@ from pxr import Usd
 from mcfly.control.rmpflow import FrankaRMPFlowController
 from mcfly.utilities import usd_util
 from mcfly.extensions.templates.extension_ui_templates import ExtensionUiTemplate
-from .control import AssemblyControl
 
 
 class AssemblyUI(ExtensionUiTemplate):
@@ -124,7 +123,7 @@ class AssemblyUI(ExtensionUiTemplate):
                     "on_clicked_fn": self._on_reset,
                 }
                 self._buttons["Reset"] = btn_builder(**dict)
-                self._buttons["Reset"].enabled = False
+                self._buttons["Reset"].enabled = True
 
             self.setup_post_load()
 
@@ -133,6 +132,10 @@ class AssemblyUI(ExtensionUiTemplate):
 
     def setup_post_load(self, *args, **kwargs):
         pass
+
+    async def _init_world(self):
+        """See https://docs.omniverse.nvidia.com/isaacsim/latest/how_to_guides/environment_setup.html"""
+        await self._world.reset_async()
 
     def _get_stage(self) -> Usd.Stage:
         return omni.usd.get_context().get_stage()
@@ -149,7 +152,6 @@ class AssemblyUI(ExtensionUiTemplate):
     def _on_load_robot(self):
         prim_path = self._bot_prim
         self._robot = Robot(prim_path, name='franka')
-        self._robot.initialize()
         logging.info("Robot loaded")
 
         self._controller = FrankaRMPFlowController(name="target_follower_controller", robot_articulation=self._robot)
@@ -159,6 +161,7 @@ class AssemblyUI(ExtensionUiTemplate):
         if self.scene.object_exists('Manipulator'):
             self.scene.remove_object('Manipulator', registry_only=True)
 
+        self._robot.initialize()
         self.scene.add(SingleManipulator(self._bot_prim, end_effector_prim_name='tcp', name='Manipulator'))
         if self._goal_prim not in ("", "/World"):
             if self.scene.object_exists("Goal"):
@@ -197,22 +200,31 @@ class AssemblyUI(ExtensionUiTemplate):
         if self._usd_file.strip() != '':
             logging.info("Loading USD file")
             await open_stage_async(usd_path=self._usd_file)
-        self._world = World(**self._world_settings)
-        await self._world.initialize_simulation_context_async()
-        self.setup_scene()
-
-        await self._world.reset_async()
-        await self._world.pause_async()
-        self.setup_post_load()
+            await self._on_reset_async()
 
     def _on_move(self, val):
         asyncio.ensure_future(self._on_follow_target_event_async(val))
 
     def _on_reset(self):
-        async def _on_reset_async():
-            await omni.kit.app.get_app().next_update_async()
+        asyncio.ensure_future(self._on_reset_async())
 
-        asyncio.ensure_future(_on_reset_async())
+    async def _on_reset_async(self):
+        if self._world is not None:
+            self._world.stop()
+            self._world.clear_all_callbacks()
+
+        self._world = World(**self._world_settings)
+        await self._world.initialize_simulation_context_async()
+
+        await self._world.play_async()
+        await update_stage_async()
+
+        self.scene.clear(registry_only=True)
+        self.setup_scene()
+
+        await self._init_world()
+        await self._world.pause_async()
+        self.setup_post_load()
 
     async def _on_follow_target_event_async(self, val):
         if val:
