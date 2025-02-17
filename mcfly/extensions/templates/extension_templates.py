@@ -1,8 +1,11 @@
+from abc import ABC, ABCMeta, abstractmethod
+
 import carb
+from isaacsim.core.api import World
 import omni.ext
 import omni.kit.app
 
-from mcfly.extensions.templates.extension_ui_template import ExtensionUiTemplate
+from mcfly.extensions.templates.extension_ui_templates import ExtensionUiTemplate
 
 
 class ExtensionTemplate(omni.ext.IExt):

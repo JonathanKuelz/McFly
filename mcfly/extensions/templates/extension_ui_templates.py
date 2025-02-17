@@ -7,7 +7,9 @@ import omni.kit.ui
 class ExtensionUiTemplate(ABC):
     """Boilerplate code for a UI builder"""
 
-    def __init__(self, window_title: str, menu_path: Optional[str] = None):
+    def __init__(self, window_title: str,
+                 menu_path: Optional[str] = None,
+                 ):
         """Set up some minimal information.
 
         Args:
@@ -28,17 +30,28 @@ class ExtensionUiTemplate(ABC):
 
     def on_toggle(self, *args, **kwargs):
         """Toggle window visibility"""
-        self.build_ui()
+        self.build_window()
         if self._window is not None:
+            with self._window.frame:
+                self.build_ui()
             self._window.visible = not self._window.visible
 
     @abstractmethod
+    def build_window(self):
+        """
+        Build the window in the underlying windowing system.
+
+        This needs a custom implementation
+        """
+        pass
+
     def build_ui(self):
         """
         Build the Graphical User Interface (GUI) in the underlying windowing system.
 
         This needs a custom implementation
         """
+        pass
 
     def cleanup(self):
         """Clean up window and menu"""

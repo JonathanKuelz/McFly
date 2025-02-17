@@ -667,7 +667,7 @@
 
 
     // This enables python language server. Seems to work slightly better than jedi:
-    "python.jediEnabled": false, 
+    "python.jediEnabled": false,
 
     // We use "black" as a formatter:
     "python.formatting.provider": "black",

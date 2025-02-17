@@ -1,11 +1,11 @@
 import omni.ui as ui
 
-from mcfly.extensions.templates.extension_ui_template import ExtensionUiTemplate
+from mcfly.extensions.templates.extension_ui_templates import ExtensionUiTemplate
 
 
 class HelloWorldUI(ExtensionUiTemplate):
 
-    def build_ui(self):
+    def build_window(self):
         """
         Build a small window with a button that does nothing.
         """

@@ -1,0 +1,31 @@
+[core]
+reloadable = true
+order = 0
+
+[package]
+version = "0.1.0"
+category = "simulation"  # Unsure if this has any effect
+title = "Interactive Assembly"
+description = "Use this extension to perform interactive assembly."
+authors = ["Jonathan Kuelz"]
+keywords = ["Motion Planning, Kinematics, Assembly"]
+changelog = "docs/CHANGELOG.md"
+readme = "docs/README.md"
+preview_image = "data/preview.png"
+icon = "data/icon.png"
+
+[dependencies]
+"omni.kit.uiapp" = {}
+
+# define the Python module that the extension provides
+[[python.module]]
+name = "mcfly"
+path = "/home/chicken/Code/McFly"
+public = true
+searchExt = false
+
+[[python.module]]
+name = "AssemblyExtension"
+
+[settings]
+exts."AssemblyExtension".timeout = 10
