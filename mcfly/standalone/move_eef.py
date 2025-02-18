@@ -68,16 +68,6 @@ def main(sim: SimulationApp):
     my_world._physics_context.set_solver_type("TGS")
     initial_steps = 100
     ################################################################
-    print("Start simulation...")
-    robot = my_franka
-    print(
-        my_world._physics_context.get_solver_type(),
-        robot.get_solver_position_iteration_count(),
-        robot.get_solver_velocity_iteration_count(),
-    )
-    print(my_world._physics_context.use_gpu_pipeline)
-    print(articulation_controller.get_gains())
-    print(articulation_controller.get_max_efforts())
     robot = my_franka
     print("**********************")
 
@@ -101,7 +91,7 @@ def main(sim: SimulationApp):
         if task_finished or i < initial_steps:
             continue
 
-        if not my_controller.init_curobo:
+        if not my_controller.is_initialized:
             my_controller.reset(ignore_substring, robot_prim_path)
 
         observations = my_world.get_observations()

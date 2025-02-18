@@ -1,9 +1,9 @@
 # IsaacSim imports
-from isaacsim.core.api.objects import FixedCuboid, DynamicCuboid
+from isaacsim.core.api.objects import FixedCuboid
 from isaacsim.core.api.tasks import BaseTask
 from isaacsim.core.api.scenes.scene import Scene
 from isaacsim.core.prims import SingleXFormPrim
-from isaacsim.core.utils.prims import create_prim, is_prim_path_valid
+from isaacsim.core.utils.prims import is_prim_path_valid
 from isaacsim.core.utils.string import find_unique_string_name
 from omni.isaac.franka import Franka
 
@@ -83,7 +83,7 @@ class ReachTask(BaseTask):
         self.goal_prim.set_world_pose(position=self.target_position, orientation=self.target_orientation)
         scene.add(self.goal_prim)
 
-        wall = FixedCuboid(name='wall', prim_path='/World/wall', position=[0.2, 0.3, 0.4], scale=[.6, 0.05, .2])
+        wall = FixedCuboid(name='wall', prim_path='/World/wall', position=[0.2, 0.25, 0.2], scale=[0.6, 0.05, 0.4])
         scene.add(wall)
 
         robot = self.set_robot(scene)

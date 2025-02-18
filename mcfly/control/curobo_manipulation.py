@@ -35,7 +35,6 @@ class ManipulationController(MoveToController):
         robot_config_path: Union[str, Path],
         name: str = "manipulation_controller",
         cmd_joint_names: Optional[List[str]] = None,
-        constrain_grasp_approach: bool = False,
     ) -> None:
         """Initializes the controller.
 
