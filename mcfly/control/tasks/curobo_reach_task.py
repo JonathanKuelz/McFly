@@ -1,17 +1,13 @@
+from abc import abstractmethod
+
 # IsaacSim imports
-from isaacsim.core.api.objects import FixedCuboid
 from isaacsim.core.api.tasks import BaseTask
 from isaacsim.core.api.scenes.scene import Scene
-from isaacsim.core.prims import SingleXFormPrim
-from isaacsim.core.utils.prims import is_prim_path_valid
-from isaacsim.core.utils.string import find_unique_string_name
-from omni.isaac.franka import Franka
 
 import numpy as np
 
 
 class ReachTask(BaseTask):
-    # TODO: It could be cleaner to implement this as mg.MotionPolicyController
     """Boilerplate code for manipulating an object with a single robot in IsaacSim."""
 
     def __init__(self, name: str):
@@ -22,8 +18,8 @@ class ReachTask(BaseTask):
         """
         super().__init__(name=name)
         self.goal: str = 'GoalPose'
-        self.target_position = np.array([.3, 0, .5])
-        self.target_orientation = np.array([0, 0, 0, 1])
+        self.target_position = np.array([0., 0., 0.])
+        self.target_orientation = np.array([1., 0., 0., 0.])
         self.goal_prim = None
         self._robot = None
 
@@ -61,31 +57,14 @@ class ReachTask(BaseTask):
         }
         return observations
 
-    def set_robot(self, scene):
-        franka_prim_path = find_unique_string_name(
-            initial_name="/World/Franka", is_unique_fn=lambda x: not is_prim_path_valid(x)
-        )
-        franka_robot_name = find_unique_string_name(
-            initial_name="my_franka", is_unique_fn=lambda x: not scene.object_exists(x)
-        )
-        return Franka(
-            prim_path=franka_prim_path, name=franka_robot_name, end_effector_prim_name="panda_hand"
-        )
-
+    @abstractmethod
     def set_up_scene(self, scene: Scene):
-        """Extracts the setup_scene shipped with the CuRobo Stacking controller."""
-        super().set_up_scene(scene)
-        scene.add_default_ground_plane()
-        self.prim_path = find_unique_string_name(initial_name=f'/World/{self.goal}',
-                                                 is_unique_fn=lambda x: not is_prim_path_valid(x))
-        self.goal_prim = SingleXFormPrim(name=self.goal,
-                                         prim_path=self.prim_path)
-        self.goal_prim.set_world_pose(position=self.target_position, orientation=self.target_orientation)
-        scene.add(self.goal_prim)
+        """Set up the scene for the task. This method needs to populate the following properties:
+            - self.goal_prim: The goal primitive.
+            - self._robot: The robot to be used for this task.
 
-        wall = FixedCuboid(name='wall', prim_path='/World/wall', position=[0.2, 0.25, 0.2], scale=[0.6, 0.05, 0.4])
-        scene.add(wall)
+        Args:
+            scene (_type_): The current scene.
 
-        robot = self.set_robot(scene)
-        self._robot = robot
-        scene.add(robot)
+        """
+        return super().set_up_scene(scene)

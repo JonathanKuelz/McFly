@@ -29,8 +29,8 @@ class MoveToController(BaseController):
     """
 
     default_collision_cache = {"obb": 10, "mesh": 10}  # Default arguments for collision cache sizes
-    reach_pos_threshold: float = 0.02  # Threshold for reaching the target position [m]
-    reach_ori_threshold: float = 1.  # Threshold for reaching the target orientation [deg]
+    reach_pos_threshold: float = 0.005  # Threshold for reaching the target position [m]
+    reach_ori_threshold: float = 1.5  # Threshold for reaching the target orientation [deg]
     replan_threshold: float = 0.05  # Threshold for pose distance triggering re-planning
     min_replan_requency: int = 2  # Will wait at least this many steps before replanning
 
@@ -71,7 +71,8 @@ class MoveToController(BaseController):
         self.is_initialized = False
 
         self._ignore_substrings = [self.robot.prim_path, 'material', 'Plane']
-        self._ground_plane = Cuboid("ground_plane", [0, 0, -.1, 0, 0, 0, 1], [5, 5, .2]) if has_ground_plane else None
+        self._ground_plane = Cuboid("/World/GroundPlane", [0, 0, -.1, 1, 0, 0, 0], dims=[5, 5, .2]) \
+            if has_ground_plane else None
         self._step_idx = 0
         self._control_freq = control_freq
 
@@ -86,7 +87,6 @@ class MoveToController(BaseController):
         self.cmd_joint_names = cmd_joint_names
         self.tensor_args = TensorDeviceType()  # TODO: this defaults to cuda:0
         self.robot_cfg = load_yaml(robot_config_path)["robot_cfg"]
-        self.robot_cfg["kinematics"]["collision_spheres"] = "spheres/franka_collision_mesh.yml" # TODO: check
 
         self._world_cfg = self.usd_helper.get_obstacles_from_stage(ignore_substring=self._ignore_substrings)
         if self._ground_plane is not None:
@@ -121,7 +121,6 @@ class MoveToController(BaseController):
         self._last_pose = None
         self.idx_list = None
 
-
     @property
     def robot_name(self) -> str:
         return self.robot.name
@@ -147,9 +146,8 @@ class MoveToController(BaseController):
         if self._last_pose is None:
             self._last_pose = pose
 
-        replan = (self._step_idx % self.min_replan_requency == 0
-                  and sum(pose.distance(self._last_pose)) > self.replan_threshold) \
-            or self.cmd_plan is None
+        replan = self._step_idx % self.min_replan_requency == 0 \
+            and sum(pose.distance(self._last_pose)) > self.replan_threshold
 
         if replan:
             self._last_pose = pose
@@ -264,8 +262,6 @@ class MoveToController(BaseController):
         obstacles = self.usd_helper.get_obstacles_from_stage(
             ignore_substring=ignore_substring, reference_prim_path=robot_prim_path
         ).get_collision_check_world()
-        plane_proxy = Cuboid("ground_plane", [0.0, 0.0, -0.1, 1, 0, 0, 0.0], [10, 10, 0.2])
-        obstacles.add_obstacle(plane_proxy)
         if self._ground_plane is not None:  # Ground plane cannot be parsed by the usd helper
             obstacles.add_obstacle(self._world_cfg.cuboid[-1])
         self.motion_gen.update_world(obstacles)
