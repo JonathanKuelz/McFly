@@ -27,7 +27,7 @@ class ReachTask(BaseTask):
         """Resets all task related variables."""
         pass
 
-    def set_goal(self, observations: dict) -> None:
+    def update(self, observations: dict) -> None:
         """Gets the position if the target object.
 
         Args:
@@ -43,11 +43,12 @@ class ReachTask(BaseTask):
             dict: The current observations.
         """
         joints_state = self._robot.get_joints_state()
-        end_effector_position, _ = self._robot.end_effector.get_local_pose()
+        eef_pos, eef_ori = self._robot.end_effector.get_local_pose()
         observations = {
             self._robot.name: {
                 "joint_positions": joints_state.positions,
-                "end_effector_position": end_effector_position,
+                "end_effector_position": eef_pos,
+                "end_effector_orientation": eef_ori
             }
         }
         pos, ori = self.goal_prim.get_world_pose()

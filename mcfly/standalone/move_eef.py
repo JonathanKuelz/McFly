@@ -111,13 +111,13 @@ def main(sim: SimulationApp):
         my_world.step(render=True)
     my_task.reset()
     observations = my_world.get_observations()
-    my_task.set_goal(observations)
+    my_task.update(observations)
     add_extensions(sim)
 
     i = 0
     while sim.is_running():
         my_world.step(render=True)  # necessary to visualize changes
-        my_task.set_goal(observations)
+        my_task.update(observations)
         i += 1
 
         if i < initial_steps:

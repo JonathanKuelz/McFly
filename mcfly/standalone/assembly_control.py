@@ -85,9 +85,8 @@ class ControlFrankaTask(ManipulationTask):
         scene.add(robot)
         self._robot = robot
         self._task_objects[robot.name] = robot
-        self.target_object = sorted(self._task_objects)[0]
         self.drop_position = np.array([0.5, 0., 0.2])
-        self.drop_orientation = np.array([0., 0., 0., 1.])
+        self.drop_orientation = np.array([0., 1., 0., 0.])
 
 
 def main(sim: SimulationApp):
@@ -100,11 +99,12 @@ def main(sim: SimulationApp):
     stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
 
     my_task = ControlFrankaTask(name='Learning to Manipulate',
-                                static_position_offset=np.array([0.0, 0.0, 0.2]),
+                                static_position_offset=np.array([0.0, 0.0, 0.1]),
                                 static_rotation_offset=np.array([0.0, 1.0, 0.0, 0.0])
                                 )
     my_world.add_task(my_task)
     my_world.reset()
+    cubes = my_task.object_names
 
     my_franka = my_world.scene.get_object(robot_name)
     franka_config = join_path(get_robot_configs_path(), "franka.yml")
@@ -122,20 +122,21 @@ def main(sim: SimulationApp):
     my_franka.set_solver_velocity_iteration_count(4)
     my_franka.set_solver_position_iteration_count(124)
     my_world._physics_context.set_solver_type("TGS")
-    initial_steps = 100
+    initial_steps = 240
 
     my_franka.gripper.open()
     for _ in range(wait_steps):
         my_world.step(render=True)
     my_task.reset()
+    my_task.set_target_object(cubes[0])
     observations = my_world.get_observations()
-    my_task.set_goal(observations)
+    my_task.update(observations)
     add_extensions(sim)
 
     i = 0
+    first_cube_placed = False
     while sim.is_running():
         my_world.step(render=True)  # necessary to visualize changes
-        my_task.set_goal(observations)
         i += 1
 
         if i < initial_steps:
@@ -145,15 +146,27 @@ def main(sim: SimulationApp):
             my_controller.reset(ignore_substring, robot_prim_path)
 
         observations = my_world.get_observations()
+        my_task.update(observations)
+
         sim_js = my_franka.get_joints_state()
-        art_action = my_controller.forward(sim_js, cmd_joint_names)
+        art_action = my_controller.forward(sim_js, cmd_joint_names, observations=observations)
         if art_action is not None:
             articulation_controller.apply_action(art_action)
+
+        if my_controller.reached_target(observations):
+            if my_task.object_grasped:
+                my_controller.detach_obj()
+                if not first_cube_placed:
+                    my_task.drop_position = my_task.drop_position + np.array([0., 0., .07])
+                first_cube_placed = True
+                my_task.set_target_object(cubes[1])
+            else:
+                grasp_obj = cubes[1] if first_cube_placed else cubes[0]
+                my_controller.attach_obj(sim_js, cmd_joint_names, grasp_obj)
+                my_task.set_target_object(grasp_obj)
 
     sim.close()
 
 
 if __name__ == '__main__':
     main(_sim)
-
-    # TODO: Next up: as soon as close enough to the pick object, pick and move to drop position

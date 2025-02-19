@@ -40,7 +40,7 @@ class MoveToController(BaseController):
         task: BaseTask,
         robot: Robot,
         robot_config_path: Union[str, Path],
-        name: str = "Default Controller",
+        name: str = "DefaultController",
         cmd_joint_names: Optional[List[str]] = None,
         control_freq: int = 3,
         has_ground_plane: bool = True,
@@ -129,12 +129,14 @@ class MoveToController(BaseController):
         self,
         joint_state: JointState,
         joint_names: list,
+        force_replan: bool
     ) -> Optional[ArticulationAction]:
         """Computes the next joint articulation.
 
         Args:
             joint_state (JointState): Current joint state.
             joint_names (list): Joint names corresponding to the joint state.
+            force_replan (bool): If true, this forward function will create a new motion plan in any case.
 
         Returns:
             ArticulationAction: The next joint articulation. If planning failed, this will return None.
@@ -148,6 +150,7 @@ class MoveToController(BaseController):
 
         replan = self._step_idx % self.min_replan_requency == 0 \
             and sum(pose.distance(self._last_pose)) > self.replan_threshold
+        replan = replan or force_replan
 
         if replan:
             self._last_pose = pose
