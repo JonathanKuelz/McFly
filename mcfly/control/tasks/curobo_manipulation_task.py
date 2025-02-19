@@ -1,13 +1,13 @@
+from abc import abstractmethod
 from typing import List, Optional, Union
+
+# CuRobo imports
+from curobo.types.base import TensorDeviceType
+from curobo.types.math import Pose
 
 # IsaacSim imports
 from isaacsim.core.api.tasks import BaseTask
-from isaacsim.core.api.objects import DynamicCuboid
 from isaacsim.core.api.scenes.scene import Scene
-from isaacsim.core.utils.prims import is_prim_path_valid
-from isaacsim.core.utils.stage import get_stage_units
-from isaacsim.core.utils.string import find_unique_string_name
-from omni.isaac.franka import Franka
 
 import numpy as np
 
@@ -24,56 +24,37 @@ class ManipulationTask(BaseTask):
 
         Args:
             name (str): A unique name for this task.
+            static_position_offset (Optional[Union[np.array, List[float]]], optional): The static position offset to
+                apply to the target object to obtain a grasp pose. Defaults to None.
+            static_rotation_offset (Optional[Union[np.array, List[float]]], optional): The static rotation offset to
+                apply to the target object to obtain a grasp pose. Defaults to None.
         """
         super().__init__(name=name)
-        self.target_object = None
-        self.target_position = None
-        self._target_orientation = None
-        self.object_grasped: Optional[str] = None
-        self.target_object = 'cube'  # Todo: Remove
-        self.target_position = np.array([0.55, -0.3, 0.5])  # Todo: Remove
-
-        self._robot = None  # Todo: Set it properly
-        self._cube_size = np.array([0.0515, 0.0515, 0.0515])  # TODO: get rid of this
+        self.object_grasped = False
+        self.target_object_name = None
+        self.tensor_args = TensorDeviceType()
 
         if static_position_offset is None:
-            static_position_offset = [0, 0, 0]
-        elif isinstance(static_position_offset, np.array):
-            static_position_offset = static_position_offset.tolist()
-        self.static_position_offset = static_position_offset
+            static_position_offset = np.array([0., 0., 0.])
+        elif not isinstance(static_position_offset, np.ndarray):
+            static_position_offset = np.array(static_position_offset)
+        self.static_position_offset: np.array = static_position_offset
 
         if static_rotation_offset is None:
-            static_rotation_offset = [0, 0, 0]
-        elif isinstance(static_rotation_offset, np.array):
-            static_rotation_offset = static_rotation_offset.tolist()
-        self.static_rotation_offset = static_rotation_offset
+            static_rotation_offset = np.array([1., 0., 0., 0.])
+        elif not isinstance(static_rotation_offset, np.ndarray):
+            static_rotation_offset = np.array(static_rotation_offset)
+        self.static_rotation_offset: np.array = static_rotation_offset
+
+        self.drop_position = np.array([0., 0., 0.])
+        self.drop_orientation = np.array([1., 0., 0., 0.])
 
     @property
-    def target_orientation(self):
-        if self._target_orientation is None:
-            return np.array([0, 0, 0, 1])
-        return self._target_orientation
-
-    def reset(self) -> None:
-        """Resets all task related variables."""
-        self.target_object = None
-        self._target_orientation = None
-        self.object_grasped = False
-        self.target_object = 'cube'  # Todo: Remove
-        self.target_position = np.array([0.55, -0.3, 0.5])  # Todo: Remove
-
-    def get_pick_position(self, observations: dict) -> None:
-        """Gets the pick position for the target object, assuming the object position IS the pick position.
-
-        Args:
-            observations (dict): World observations.
-        """
-        assert not self.object_grasped, "There's already an object grasped."
-        self.target_position = observations[self.target_object]["position"] + np.array([
-            0,
-            0,
-            self._cube_size[2] / 2 + 0.092,
-        ])
+    def offset(self) -> Pose:
+        return Pose.from_list(
+            self.static_position_offset.tolist() + self.static_rotation_offset.tolist(),
+            self.tensor_args
+        )
 
     def get_observations(self) -> dict:
         """Make sure all objects that need to be kept track off are in the observations.
@@ -96,55 +77,43 @@ class ManipulationTask(BaseTask):
             observations[name] = {
                 "position": pos,
                 "orientation": ori,
-                "target_position": np.array(  # TODO
-                    [
-                        self.target_position[0],
-                        self.target_position[1],
-                        (self._cube_size[2]) + self._cube_size[2] / 2.0,
-                    ]
-                ),
             }
         return observations
 
-    # TODO: The following code should be replaced
+    def reset(self) -> None:
+        """Resets all task related variables."""
+        self.object_grasped = False
+        self.target_position = np.array([0., 0., 0.])
+        self.target_orientation = np.array([1., 0., 0., 0.])
 
-    def set_robot(self, scene):
-        franka_prim_path = find_unique_string_name(
-            initial_name="/World/Franka", is_unique_fn=lambda x: not is_prim_path_valid(x)
-        )
-        franka_robot_name = find_unique_string_name(
-            initial_name="my_franka", is_unique_fn=lambda x: not scene.object_exists(x)
-        )
-        return Franka(
-            prim_path=franka_prim_path, name=franka_robot_name, end_effector_prim_name="panda_hand"
-        )
+    def set_goal(self, observations: dict) -> None:
+        """Gets the pick position for the target object, assuming the object position IS the pick position.
 
+        Args:
+            observations (dict): World observations.
+        """
+        if self.object_grasped:
+            self.target_position = self.drop_position
+            self.target_orientation = self.drop_orientation
+        else:
+            pos = observations[self.target_object]["position"]
+            ori = observations[self.target_object]["orientation"]
+            pose = Pose.from_list(pos.tolist() + ori.tolist(), self.tensor_args)
+            goal = pose.multiply(self.offset)
+            self.target_position = goal.position.detach().cpu().numpy()
+            self.target_orientation = goal.quaternion.detach().cpu().numpy()
+
+    @abstractmethod
     def set_up_scene(self, scene: Scene):
-        """Extracts the setup_scene shipped with the CuRobo Stacking controller."""
-        super().set_up_scene(scene)
-        scene.add_default_ground_plane()
-        for i in range(2):
-            color = np.random.uniform(size=(3,))
-            cube_prim_path = find_unique_string_name(
-                initial_name="/World/Cube", is_unique_fn=lambda x: not is_prim_path_valid(x)
-            )
-            cube_name = find_unique_string_name(
-                initial_name="cube", is_unique_fn=lambda x: not scene.object_exists(x)
-            )
-            cube = scene.add(
-                DynamicCuboid(
-                    name=cube_name,
-                    position=[i / 3, .3, .1],
-                    orientation=None,
-                    prim_path=cube_prim_path,
-                    scale=np.array([0.0515, 0.0515, 0.0515]) / get_stage_units(),
-                    size=1.0,
-                    color=color,
-                )
-            )
-            self._task_objects[cube_name] = cube
-        robot = self.set_robot(scene)
-        scene.add(robot)
-        self._robot = robot
-        self._task_objects[robot.name] = robot
-        self._move_task_objects_to_their_frame()
+        """Set up the scene for the task. This method needs to populate the following properties:
+            - self._robot: The robot to be used for this task.
+            - self._task_objects: The objects to be manipulated.
+            - self.target_object: The current object to be manipulated.
+            - self.drop_position: The current position to drop the object.
+            - self.drop_orientation: The current orientation to drop the object.
+
+        Args:
+            scene (Scene): The current scene.
+
+        """
+        return super().set_up_scene(scene)

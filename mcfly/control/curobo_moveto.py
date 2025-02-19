@@ -40,7 +40,7 @@ class MoveToController(BaseController):
         task: BaseTask,
         robot: Robot,
         robot_config_path: Union[str, Path],
-        name: str = "manipulation_controller",
+        name: str = "Default Controller",
         cmd_joint_names: Optional[List[str]] = None,
         control_freq: int = 3,
         has_ground_plane: bool = True,

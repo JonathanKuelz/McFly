@@ -8,7 +8,7 @@ import numpy as np
 
 
 class ReachTask(BaseTask):
-    """Boilerplate code for manipulating an object with a single robot in IsaacSim."""
+    """Boilerplate code for moving to a goal with a single robot in IsaacSim."""
 
     def __init__(self, name: str):
         """The task can be setup with just a name.
@@ -28,7 +28,7 @@ class ReachTask(BaseTask):
         pass
 
     def set_goal(self, observations: dict) -> None:
-        """Gets the pick position for the target object, assuming the object position IS the pick position.
+        """Gets the position if the target object.
 
         Args:
             observations (dict): World observations.
@@ -64,7 +64,7 @@ class ReachTask(BaseTask):
             - self._robot: The robot to be used for this task.
 
         Args:
-            scene (_type_): The current scene.
+            scene (Scene): The current scene.
 
         """
         return super().set_up_scene(scene)
