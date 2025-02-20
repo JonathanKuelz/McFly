@@ -1,0 +1,32 @@
+{
+    "ControllerNodesPy": {
+        "version": 1,
+        "language": "python",
+        "icon": "ControllerNodes/ogn/python/nodes/icons/careerchicken.png",
+        "uiName": "OgnControllerNodesPy",
+        "description": ["A CuRobo Manipulation Controller."],
+        "categoryDefinitions": "config/CategoryDefinition.json",
+        "categories": ["extension:Category"],
+        "inputs": {
+            "inputAttribute1": {
+                "type": "int",
+                "uiName": "Input Attribute 1",
+                "description": "The first input is zero.",
+                "default": 0
+            },
+            "inputAttribute2": {
+                "type": "int",
+                "uiName": "Input Attribute 2",
+                "description": "Description for this attribute would be nice",
+                "default": 1
+            }
+        },
+        "outputs": {
+            "outputAttribute1": {
+                "type": "double",
+                "uiName": "Output Attribute 1",
+                "description": "This is the output attribute and it should be one."
+            }
+        }
+    }
+}

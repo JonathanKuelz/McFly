@@ -8,15 +8,15 @@ reloadable = true
 order = 0
 
 [package]
-version = "0.1.1"
-category = "example"
-title = "HelloWorldExtension"
-description = "Learning to walk"
-authors = ["Jonathan"]
-keywords = ["Hello","Keyword"]
+version = "0.1.0"
+category = "simulation"
+title = "Debug Extension"
+description = "This extension loads a stage (if desired) and start code at a custom entrypoint"
+authors = ["Jonathan Külz"]
+keywords = ["Debugging"]
 changelog = "docs/CHANGELOG.md"
 readme = "docs/README.md"
-preview_image = "data/preview.png"
+preview_image = "data/icon.png"
 icon = "data/icon.png"
 
 [dependencies]
@@ -26,11 +26,12 @@ icon = "data/icon.png"
 [[python.module]]
 name = "mcfly"
 path = "/home/chicken/Code/McFly"
-public = true  # This is important -- otherwise, the HelloWorldExtension cannot see the module
-searchExt = false  # If true, the import will automatically scan mcfly for all extensions available
+public = true
+searchExt = false
 
 [[python.module]]
-name = "HelloWorldExtension"
+name = "DebugExtension"
 
 [settings]
-exts."HelloWorldExtension".timeout = 5
+exts."DebugExtension".timeout = 5
+

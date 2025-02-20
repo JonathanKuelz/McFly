@@ -1,11 +1,13 @@
-from abc import ABC, ABCMeta, abstractmethod
-
 import carb
-from isaacsim.core.api import World
 import omni.ext
 import omni.kit.app
 
 from mcfly.extensions.templates.extension_ui_templates import ExtensionUiTemplate
+
+
+def is_abstract(cls):
+    """Check if a class is abstract"""
+    return bool(getattr(cls, "__abstractmethods__", False))
 
 
 class ExtensionTemplate(omni.ext.IExt):
@@ -31,6 +33,9 @@ class ExtensionTemplate(omni.ext.IExt):
         """Method called when the extension is loaded/enabled"""
         carb.log_info(f"on_startup {ext_id}")
         ext_path = omni.kit.app.get_app().get_extension_manager().get_extension_path(ext_id)  # noqa
+        if is_abstract(self.ui_builder_ref):
+            # This "hack" avoids errors when this template is auto-detected by omniverse
+            return
         self.ui_builder = self.ui_builder_ref(window_title=self.name, menu_path=f"Window/{self.name}")
 
     def on_shutdown(self):
@@ -38,4 +43,5 @@ class ExtensionTemplate(omni.ext.IExt):
         carb.log_info("on_shutdown")
 
         # clean up UI
-        self.ui_builder.cleanup()
+        if self.ui_builder:
+            self.ui_builder.cleanup()
