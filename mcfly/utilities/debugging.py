@@ -16,6 +16,10 @@ class DebugInterfaceBaseClass(ABC):
         pass
 
     @abstractmethod
+    def cleanup():
+        pass
+
+    @abstractmethod
     def setup_scene():
         pass
 

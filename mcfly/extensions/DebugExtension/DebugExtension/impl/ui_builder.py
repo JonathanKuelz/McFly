@@ -25,6 +25,7 @@ class DebuggerUiBuilder(ExtensionUiTemplate):
         self._buttons = dict()
         self._usd_path: str = ''
 
+        self._debug_interface = None
         self._stage = None
         self._world = None
         self._on_load_world()
@@ -101,8 +102,21 @@ class DebuggerUiBuilder(ExtensionUiTemplate):
                 self._buttons['Reset'] = btn_builder(
                     label="RESET", text="RESET", on_clicked_fn=self._on_reset, tooltip="Reset the scene.")
 
+    def cleanup(self):
+        if self._window is not None:
+            self._window.destroy()
+            self._window = None
+
+        if self._menu is not None:
+            try:
+                omni.kit.ui.get_editor_menu().remove_item(self._menu)
+            except:
+                omni.kit.ui.get_editor_menu().remove_item(self._menu_path)
+            self._menu = None
+
     def setup(self):
         """Can this be left empty?"""
+        logging.warning('Setup')
         pass
 
     # --------------- UI Callbacks ---------------
@@ -145,8 +159,8 @@ class DebuggerUiBuilder(ExtensionUiTemplate):
 
     async def _on_load_usd_async(self):
         """The user pressed the LOAD button."""
-        pth = Path(self._usd_file)
-        if self._usd_file.strip() != '':
+        pth = Path(self._usd_path)
+        if self._usd_path.strip() != '':
             if not pth.exists():
                 logging.error(f"File {pth} does not exist.")
                 return
@@ -154,9 +168,10 @@ class DebuggerUiBuilder(ExtensionUiTemplate):
                 logging.error(f"File {pth} is not a USD file.")
                 return
 
-        if self._usd_file.strip() != '':
+        if self._usd_path.strip() != '':
             logging.info("Loading USD file")
-            await open_stage_async(usd_path=self._usd_file)
+            await open_stage_async(usd_path=self._usd_path)
+            await self._on_load_world_async()
             await self._on_reset_async()
 
     async def _on_load_code_async(self):
@@ -206,6 +221,9 @@ class DebuggerUiBuilder(ExtensionUiTemplate):
         asyncio.ensure_future(self._on_reset_async())
 
     async def _on_reset_async(self):
+        """Reset the scene"""
+        if self.debug_interface is not None:
+            self.debug_interface.cleanup()
         self._stage = omni.usd.get_context().get_stage()
         self._world.clear_all_callbacks()
         self.scene.clear(registry_only=True)
@@ -214,7 +232,6 @@ class DebuggerUiBuilder(ExtensionUiTemplate):
         await self._world.reset_async()
         await self._world.pause_async()
         await omni.kit.app.get_app().next_update_async()
-
         self.setup()
 
     def _world_cleanup(self):

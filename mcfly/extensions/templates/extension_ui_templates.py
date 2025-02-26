@@ -1,6 +1,8 @@
 from abc import abstractmethod, ABC
 from typing import Optional
 
+from isaacsim.core.api import World
+
 import omni.kit.ui
 
 
@@ -45,6 +47,11 @@ class ExtensionUiTemplate(ABC):
         """
         pass
 
+    @abstractmethod
+    def _world_cleanup(self):
+        """Clean up the current world"""
+        pass
+
     def build_ui(self):
         """
         Build the Graphical User Interface (GUI) in the underlying windowing system.
@@ -55,7 +62,6 @@ class ExtensionUiTemplate(ABC):
 
     def cleanup(self):
         """Clean up window and menu"""
-        # destroy window
         if self._window is not None:
             self._window.destroy()
             self._window = None
@@ -66,3 +72,10 @@ class ExtensionUiTemplate(ABC):
             except:
                 omni.kit.ui.get_editor_menu().remove_item(self._menu_path)
             self._menu = None
+
+    def on_stage_event(self, event):
+        """Handle stage events, at least the one where this extension is closed."""
+        if event.type == int(omni.usd.StageEventType.CLOSED):
+            if World.instance() is not None:
+                self._world_cleanup()
+            self.cleanup()

@@ -20,7 +20,13 @@ preview_image = "data/icon.png"
 icon = "data/icon.png"
 
 [dependencies]
+"isaacsim.util.debug_draw" = {}
 "omni.kit.uiapp" = {}
+"omni.kit.debug.vscode" = {}
+# The ones below are CuRobo Dependencies, actually
+"omni.kit.asset_converter" = {}
+"omni.kit.tool.asset_importer" = {}
+"omni.isaac.asset_browser" = {}
 
 # define the Python module that the extension provides
 [[python.module]]

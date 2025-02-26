@@ -1,13 +1,21 @@
 import asyncio
 import logging
+import sys
+sys.path.append('/home/chicken/isaacsim/exts/isaacsim.asset.exporter.urdf/pip_prebundle')  # CuRobo needs these
 
+from curobo.geom.sdf.world import CollisionCheckerType, CollisionQueryBuffer, WorldCollisionConfig
+from curobo.geom.sdf.world_mesh import WorldMeshCollision
+from curobo.geom.sphere_fit import SphereFitType
+from curobo.types.base import TensorDeviceType
+from curobo.util.usd_helper import UsdHelper
 from isaacsim.core.api.controllers.articulation_controller import ArticulationController
 from isaacsim.core.prims import Articulation, SingleRigidPrim
 from isaacsim.core.utils.types import ArticulationAction
-
+from isaacsim.util.debug_draw import _debug_draw
 import numpy as np
-
 from omni.isaac.core import World
+from omni.isaac.core.prims import RigidPrimView
+import torch
 
 from mcfly.utilities.debugging import DebugInterfaceBaseClass
 
@@ -22,6 +30,8 @@ Learnings:
     2. Add the joints
     3. Add drives to the joints
     4. Create an articulation root
+- Usfeul CuRobo links:
+    - https://curobo.org/get_started/2c_world_collision.html
 """
 
 GRIPPER_PRIM = '/World/Gripper'
@@ -57,19 +67,107 @@ def close_gripper(world: World):
     controller = ArticulationController()
     controller.initialize(gripper)
     action = ArticulationAction(joint_positions=np.array([0.25, 0.25]), joint_indices=np.array([0, 1]))
+    fingers = RigidPrimView(prim_paths_expr='/World/Gripper/*finger', name='Fingers',
+                            track_contact_forces=True)  # Todo: Try what happens when I prepare_contact_sensors
 
-    def callback(dt: float):
+    # Requires local import because it will not be loaded succesfully without first enabling extensions
+    usd_helper = UsdHelper()
+    usd_helper.load_stage(world.stage)
+    obstacle = usd_helper.get_obstacles_from_stage(only_substring=['doublepipe'])
+    cfg = WorldCollisionConfig(tensor_args=TensorDeviceType(), world_model=obstacle,
+                               checker_type=CollisionCheckerType.MESH)
+    wmc = WorldMeshCollision(cfg)
+
+    def control_callback(dt: float):
         controller.apply_action(action)
 
-    world.add_physics_callback('CloseGripper', callback)
+    def force_log_callback(dt: float):
+        f = fingers.get_net_contact_forces()
+        if np.linalg.norm(f) > 1e-6:
+            sdf_info = get_sdf_per_finger(world, wmc, requires_grad=True)
+            logging.info(f"Contact forces: {f}")
+            debubg_draw_sdf(sdf_info)
+
+    world.add_physics_callback('CloseGripper', control_callback)
+    world.add_physics_callback('CuroboSdf', force_log_callback)
     world.add_physics_callback('LogMe', lambda _: logging.warning(f"{action}"))
 
     asyncio.ensure_future(world.play_async())
 
 
-def main():
-    setup_scene()
-    close_gripper()
+def debubg_draw_sdf(sdf_info, s: float = 15., w: float = 1.):
+    draw = _debug_draw.acquire_debug_draw_interface()
+    draw.clear_points()
+    draw.clear_lines()
+    for finger in ('left', 'right'):
+        dist = sdf_info[finger + '_distances'].detach().cpu().numpy()
+        mask = dist > -0.099
+        dist = dist[mask]
+        pts = sdf_info[finger + '_spheres'][:, :3].detach().cpu().numpy()[mask]
+        grads = sdf_info[finger + '_grad'][:, :3].detach().cpu().numpy()[mask]
+
+        c = .3 + .7 * ((dist - dist.min()) / np.max((dist - dist.min()))) ** 8
+        colors = np.array([[1., 0., .3, 1.]] * len(pts))
+        colors[:, 0] = c
+        draw.draw_points(pts, colors, [s] * len(pts))
+
+        endpoints = pts + grads * .1
+        draw.draw_lines(pts, endpoints, [(0., 0., 1., 1.)] * len(pts), [w] * len(pts))
+    logging.info("Drawing SDF done")
+
+
+def get_sdf_per_finger(  # Todo: Precompute the query spheres
+    world: World,
+    world_mesh_collision: WorldMeshCollision,
+    requires_grad: bool = False
+):
+    """This method parses the current forld for the finger meshes and queries their signed distance against the provided
+    worl mesh collision object.
+
+    Args:
+        world (World): The current simulation world.
+        world_mesh_collision (WorldMeshCollision): The collision representation to query against.
+
+    Returns:
+        dict: A dictionary containing sampled signed distance field for each finger. If gradients are required, the
+        dictionary will contain an additional key-value pair for them.
+    """
+    device = TensorDeviceType().device
+    usd_helper = UsdHelper()
+    usd_helper.load_stage(world.stage)
+    finger_meshes = usd_helper.get_obstacles_from_stage(only_substring=['finger'])
+
+    info = {}
+    for finger in ('left', 'right'):
+        query_spheres = list()
+        for mesh in finger_meshes.mesh:
+            if 'finger' in mesh.name and finger in mesh.name:
+                sph = mesh.get_bounding_spheres(n_spheres=512,
+                                                fit_type=SphereFitType.VOXEL_SURFACE,
+                                                surface_sphere_radius=1e-2)
+                query_spheres.extend(sph)
+        sph_tensor = torch.tensor([qs.position + [qs.radius] for qs in query_spheres],
+                                  device=device, requires_grad=requires_grad).view(1, 1, -1, 4)
+        query_buffer = CollisionQueryBuffer.initialize_from_shape(sph_tensor.shape, TensorDeviceType(), {'mesh': True})
+        d = world_mesh_collision.get_sphere_distance(sph_tensor, query_buffer, weight=torch.tensor([1.], device=device),
+                                                     activation_distance=torch.tensor([2e-2], device=device),
+                                                     compute_esdf=True)
+        info[finger + '_distances'] = d.squeeze()
+        info[finger + '_spheres'] = sph_tensor.squeeze()
+        if requires_grad:
+            info[finger + '_grad'] = query_buffer.get_gradient_buffer().squeeze()
+    return info
+
+
+def reset_articulation(world: World):
+    scene = world.scene
+    gripper = scene.get_object('Gripper')
+    if gripper.get_applied_actions() is None:
+        return  # Nothing to reset
+    controller = ArticulationController()
+    controller.initialize(gripper)
+    action = ArticulationAction(joint_positions=gripper._default_joints_state.positions[0])
+    controller.apply_action(action)
 
 
 class DebugInterface(DebugInterfaceBaseClass):
@@ -89,3 +187,6 @@ class DebugInterface(DebugInterfaceBaseClass):
 
     def execute(self):
         close_gripper(self._world)
+
+    def cleanup(self):
+        reset_articulation(self._world)
