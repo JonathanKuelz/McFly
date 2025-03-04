@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from curobo.geom.sdf.world import CollisionCheckerType, CollisionQueryBuffer, WorldCollisionConfig, \
     WorldPrimitiveCollision
 from curobo.geom.sdf.world_mesh import WorldMeshCollision
@@ -51,7 +53,7 @@ def plot_inertia_deltas(offsets,
     for i in range(2):
         ax[2, i].set_xlabel("Finger offset")
 
-    ax[2, 0].legend(fontsize='small', fancybox=True, title='Sample Resolution', loc='lower right')
+    ax[2, 0].legend(fontsize='small', fancybox=True, title='Sample Resolution', loc='lower left')
     plt.tight_layout()
     plt.show()
     print()
@@ -76,21 +78,25 @@ def main():
 
     inertia_deltas = []
     penetration_volume = []
-    offsets = np.linspace(.3, .9, 30)
+    offsets = np.linspace(.25, .7, 20)
     obj_sdf = SphereSdf(torch.tensor([[0, 0, 0, r]]))
 
-    resolutions = (20, 50, 100)
-    for resolution in resolutions:
+    resolutions = (20, 30, 50, 100,)
+    finger_resolutions = (10, 10, 10, 10,)
+    # Can't discretize the fingers too fine, this will cause memory issues
+
+    for resolution, fr in zip(resolutions, finger_resolutions):
         print(resolution)
-        lf = finger_sdfs[0].discretize(resolution)
-        rf = finger_sdfs[1].discretize(resolution)
+        lf_ = finger_sdfs[0].discretize(fr)
+        rf_ = finger_sdfs[1].discretize(fr)
         obj_inertia = obj_sdf.approximate_inertia(center=torch.tensor([0, 0, 0]), dims=[r * 2.2] * 3, pts_per_dim=resolution)
 
         id_ = []
         pv_ = []
         for delta in offsets:
             translation = torch.tensor([delta, 0, 0, 0])
-
+            lf = deepcopy(lf_)
+            rf = deepcopy(rf_)
             lf.sph[..., :4] += translation
             rf.sph[..., :4] -= translation
             finger_sdf = lf.boolean_union(rf)

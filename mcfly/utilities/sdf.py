@@ -28,7 +28,7 @@ class Sdf:
     def __init__(self, *args, **kwargs):
         self.callable = self.__error__
 
-    def __call__(self, pts: torch.Tensor, quiet: bool = False) -> torch.Tensor:
+    def __call__(self, pts: torch.Tensor, quiet: bool = True) -> torch.Tensor:
         """Returns the signed distance from the SDF to the given points."""
         shape = pts.shape
         pt_dim = shape[-1]
@@ -227,7 +227,7 @@ class CuroboSdf(Sdf):
         """
         Returns a discretized version of the SDF.
         """
-        print("Warning, this currently only supports mesh models")
+        print("Warning, discretization of curobo worlds currently only supports mesh models")
         vertices = torch.tensor(list(chain.from_iterable(m.vertices for m in self.wcm.world_model.mesh)))
         center = (torch.max(vertices, dim=0)[0] + torch.min(vertices, dim=0)[0]) / 2
         dims = torch.max(vertices, dim=0)[0] - torch.min(vertices, dim=0)[0]
