@@ -3,7 +3,10 @@ from __future__ import annotations
 from itertools import chain
 from typing import Any, Callable, Iterable, List, Sequence, Tuple
 
-from curobo.geom.sdf.world import WorldCollision
+from curobo.geom.sdf.world import CollisionCheckerType, WorldCollision, WorldCollisionConfig
+from curobo.geom.sdf.world_mesh import WorldMeshCollision
+from curobo.geom.types import Mesh, WorldConfig
+from curobo.types.base import TensorDeviceType
 import matplotlib.pyplot as plt
 import numpy as np
 import pyvista as pv
@@ -63,7 +66,7 @@ class Sdf:
         scale = (np.mean(dims) / pts_per_dim) ** 3  # Approximates the volume of a single voxel
         grid, d = self.sample(center, dims, pts_per_dim, r)
         mask = d > 0  # Inside
-        pts = torch.stack(grid, dim=-1)[mask]
+        pts = torch.stack(grid, dim=-1)[mask] - center
         x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
         xs, ys, zs = x ** 2, y ** 2, z ** 2
         I = torch.tensor([
@@ -72,6 +75,18 @@ class Sdf:
            [0,                    0,                    (xs + ys).sum() / 2]
         ]) * scale
         return I + I.T
+
+
+    def approximate_volume(self,
+                           center: torch.Tensor,
+                           dims: Iterable[float],
+                           pts_per_dim: int,
+                           r: float = 0.0
+                           ) -> float:
+        """Approximates the volume of the SDF by checking where in the sampled volume the SDF is positive."""
+        scale = (np.mean(dims) / pts_per_dim) ** 3  # Approximates the volume of a single voxel
+        grid, d = self.sample(center, dims, pts_per_dim, r)
+        return (d > 0).sum().item() * scale
 
 
     def boolean_union(self, other: Sdf) -> Sdf:
@@ -208,12 +223,12 @@ class CallableSdf(Sdf):
         self.callable = query_function
 
 
-class CuroboSdf(Sdf):
+class CuroboMeshSdf(Sdf):
     """A signed distance function representing a curobo mesh."""
 
-    def __init__(self, world_collision_model: WorldCollision):
+    def __init__(self, world_collision_model: WorldMeshCollision):
         super().__init__()
-        self.wcm = world_collision_model
+        self.wcm: WorldMeshCollision = world_collision_model
         self.callable = self._callable
 
     def _callable(self, pts: torch.Tensor) -> torch.Tensor:
@@ -223,11 +238,24 @@ class CuroboSdf(Sdf):
         sdf_info = get_sdf(query_spheres, self.wcm)
         return sdf_info['query_spheres'].distances
 
+    @classmethod
+    def from_meshes(cls, meshes: List[Mesh], max_distance: float):
+        """Sets up a Collision World and the corresponding SDF from a list of curobo meshes."""
+        cfg = WorldConfig(mesh=meshes)
+        ccfg = WorldCollisionConfig(
+            max_distance=max_distance,
+            tensor_args=TensorDeviceType(),
+            world_model=cfg,
+            checker_type=CollisionCheckerType.MESH,
+            cache={'mesh': len(meshes)}
+        )
+        world_collision = WorldMeshCollision(ccfg)
+        return cls(world_collision)
+
     def discretize(self, pts_per_dim: int) -> SphereSdf:
         """
         Returns a discretized version of the SDF.
         """
-        print("Warning, discretization of curobo worlds currently only supports mesh models")
         vertices = torch.tensor(list(chain.from_iterable(m.vertices for m in self.wcm.world_model.mesh)))
         center = (torch.max(vertices, dim=0)[0] + torch.min(vertices, dim=0)[0]) / 2
         dims = torch.max(vertices, dim=0)[0] - torch.min(vertices, dim=0)[0]
@@ -238,6 +266,18 @@ class CuroboSdf(Sdf):
         pts = torch.stack(grid, dim=-1)[include]
         r = torch.ones(pts.shape[:-1], device=pts.device) * r
         return SphereSdf(torch.concat([pts, r[..., None]], dim=-1))
+
+    @property
+    def meshes(self) -> List[Mesh]:
+        return self.wcm.world_model.mesh
+
+    @property
+    def mesh_names(self) -> List[str]:
+        return [m.name for m in self.wcm.world_model.mesh]
+
+    @property
+    def mesh_poses(self) -> List[List[float]]:
+        return [m.pose for m in self.wcm.world_model.mesh]
 
 class SphereSdf(Sdf):
     """A signed distance function representing a collection of spheres."""

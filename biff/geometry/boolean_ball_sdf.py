@@ -1,10 +1,9 @@
 from copy import deepcopy
+import time
 
-from curobo.geom.sdf.world import CollisionCheckerType, CollisionQueryBuffer, WorldCollisionConfig, \
-    WorldPrimitiveCollision
+from curobo.geom.sdf.world import CollisionCheckerType, WorldCollisionConfig
 from curobo.geom.sdf.world_mesh import WorldMeshCollision
-from curobo.geom.sphere_fit import SphereFitType
-from curobo.geom.types import Sphere, WorldConfig
+from curobo.geom.types import WorldConfig
 from curobo.types.base import TensorDeviceType
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,7 +14,7 @@ import pyvista as pv
 
 from docbrown.utilities.geometry import pv_to_trimesh, show_as_pv_mesh, show_pv_mesh
 from mcfly.utilities.curobo import get_sdf, stack_spheres, trimesh_to_curobo_mesh
-from mcfly.utilities.sdf import CuroboSdf, SphereSdf
+from mcfly.utilities.sdf import CuroboMeshSdf, SphereSdf
 
 
 def make_finger_mesh():
@@ -71,22 +70,23 @@ def main():
         ccfg = WorldCollisionConfig(
             tensor_args=TensorDeviceType(),
             world_model=cfg,
-            checker_type=CollisionCheckerType.MESH
+            checker_type=CollisionCheckerType.MESH,
+            max_distance=r
         )
         world_collision = WorldMeshCollision(ccfg)
-        finger_sdfs.append(CuroboSdf(world_collision))
+        finger_sdfs.append(CuroboMeshSdf(world_collision))
 
     inertia_deltas = []
     penetration_volume = []
     offsets = np.linspace(.25, .7, 20)
     obj_sdf = SphereSdf(torch.tensor([[0, 0, 0, r]]))
 
-    resolutions = (20, 30, 50, 100,)
-    finger_resolutions = (10, 10, 10, 10,)
+    resolutions = (20, 30, 50, 100, 150)
+    finger_resolutions = (10, 10, 10, 10, 10)
     # Can't discretize the fingers too fine, this will cause memory issues
 
     for resolution, fr in zip(resolutions, finger_resolutions):
-        print(resolution)
+        t0 = time.time()
         lf_ = finger_sdfs[0].discretize(fr)
         rf_ = finger_sdfs[1].discretize(fr)
         obj_inertia = obj_sdf.approximate_inertia(center=torch.tensor([0, 0, 0]), dims=[r * 2.2] * 3, pts_per_dim=resolution)
@@ -107,6 +107,7 @@ def main():
 
         inertia_deltas.append(id_)
         penetration_volume.append(pv_)
+        print(f'{resolution}: {time.time() - t0:.2f}s')
 
     plot_inertia_deltas(offsets, resolutions, inertia_deltas, penetration_volume)
 

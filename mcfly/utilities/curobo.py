@@ -21,7 +21,7 @@ def get_sdf(
     tensor_device_type: Optional[TensorDeviceType] = None,
     *,
     collision_types: Iterable[str] = ('mesh',),
-    activation_distance: float = 2e-2,
+    activation_distance: float = 0.,
 ) -> Dict[str, SdfInfo]:
     """Computes an sdf between arbitrary meshes approximated by spheres and a world collision representation.
 
