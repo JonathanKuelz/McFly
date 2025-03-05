@@ -1,3 +1,4 @@
+import hashlib
 from typing import List, Optional, Tuple, Union
 
 from curobo.types.math import Pose
@@ -32,7 +33,11 @@ class MoveToContactPoint(UdpWithGradient):
         super().__init__(stores_grad_during_fitness=True)
         self.moveable_sdf = moveable_sdf
         self.static_sdf = static_sdf
-        self.move_direction = move_direction.detach().cpu().numpy() if move_direction is not None else None
+        if move_direction is None:
+            self.move_direction = None
+        else:
+            self.move_direction = move_direction.detach().cpu().numpy()
+            self.move_direction = self.move_direction / np.linalg.norm(self.move_direction)
         self.threshold = threshold
 
         if np.isscalar(bounds):
@@ -46,6 +51,7 @@ class MoveToContactPoint(UdpWithGradient):
             raise ValueError(f"Invalid bounds type: {type(bounds)}")
         self._bounds = bounds
         self._start_poses = {name: pose.clone() for name, pose in zip(moveable_sdf.mesh_names, moveable_sdf.mesh_poses)}
+        self._query_cache = dict()
 
     def _eval_fitness(self, x: np.ndarray) -> np.ndarray:
         """
@@ -53,22 +59,44 @@ class MoveToContactPoint(UdpWithGradient):
 
         :param x: The displacement of the moveable SDF.
         """
-        pos = torch.tensor(x, dtype=torch.float32)
-        self._translate_mesh(pos)
-        d, g = self.moveable_sdf(self.static_sdf.sph, gradients=True)
-        idx = torch.argmin(torch.abs(d))
-
-        self._store_gradient(x, g[idx, :3].detach().cpu().numpy())
+        d, g = self._query(x)
+        idx = torch.argmax(d)  # Find closest point, then take abs because it should not be inside
+        self._store_gradient(x, g[idx, :3].detach().cpu().numpy(), where="fitness")
         return np.array([torch.abs(d[idx]).item()])
 
     def _eval_equality_constraints(self, x: np.ndarray) -> Optional[np.ndarray]:
         """
-        The translation needs to happen along the specified direction.
+        The translation needs to happen along the specified direction. Also, make sure there is no penetration of
+        the two SDFs.
         """
         if self.move_direction is None:
             return None
-        delta = x - np.dot(x, self.move_direction)
-        return np.linalg.norm(delta, keepdims=1)
+        x_projected = np.dot(x, self.move_direction) * self.move_direction
+        v = x_projected - x
+
+        d, g = self._query(x)
+        penetrate = d > 0
+        if penetrate.any():
+            penetration = np.array((penetrate.sum() / penetrate.numel()).item())
+            v_remove = g[:,  :3].mean(dim=0).detach().cpu().numpy()
+        else:
+            penetration = np.array([0])
+            v_remove = np.zeros_like(x)
+
+        grad = -np.hstack([v, v_remove])
+        c_eq = np.hstack([np.linalg.norm(v, keepdims=1), penetration])
+        self._store_gradient(x, grad, where="eq")
+        return c_eq
+
+    def _query(self, x: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Queries the signed distance, except it has already been computed."""
+        hash_ = hashlib.sha256(x.tobytes()).hexdigest()
+        if hash_ not in self._query_cache:
+            pos = torch.tensor(x, dtype=torch.float32)
+            self._translate_mesh(pos)
+            d, g = self.moveable_sdf(self.static_sdf.sph, gradients=True)
+            self._query_cache[hash_] = (d, g)
+        return self._query_cache[hash_]
 
     def _translate_mesh(self, new_pos: torch.Tensor):
         """Places the mesh at the new position."""
@@ -81,7 +109,7 @@ class MoveToContactPoint(UdpWithGradient):
         return self._bounds[:, 0].tolist(), self._bounds[:, 1].tolist()
 
     def get_nec(self) -> int:
-        return 1 if self.move_direction is not None else 0
+        return 2 if self.move_direction is not None else 1
 
     # def generate(self) -> UdpWithGradient:
     #     """

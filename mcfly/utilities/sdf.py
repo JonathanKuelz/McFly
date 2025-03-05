@@ -343,7 +343,10 @@ class CuroboMeshSdf(Sdf):
 
     def get_center(self) -> torch.Tensor:
         """Approximates the center of the SDF"""
-        vertices = torch.tensor(list(chain.from_iterable(m.vertices for m in self.wcm.world_model.mesh)))
+        vertices = torch.tensor([m.vertices for m in self.wcm.world_model.mesh])
+        for i, offset in enumerate(self.mesh_poses):
+            vertices[i] += offset[:3]
+        vertices = vertices.view(-1, 3)
         return (torch.max(vertices, dim=0)[0] + torch.min(vertices, dim=0)[0]) / 2
 
     def get_dims(self) -> torch.Tensor:

@@ -1,7 +1,6 @@
 from abc import ABC, ABCMeta, abstractmethod
 import hashlib
 import inspect
-from types import MethodType
 from typing import Collection, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -124,8 +123,71 @@ class UDP(ABC, metaclass=AbstractCloneableMetaClass):
         return Clone()
 
 
+class UdpWithGradient(UDP, ABC):
+
+    def __init__(self, stores_grad_during_fitness: bool = True):
+        """
+        A general template for UDPs that provide gradients.
+
+        :param stores_grad_during_fitness: If True, the gradient is computed during the fitness evaluation and must
+            be stored for later retrieval using _store_gradient. If false, the _get_gradient method must be implemented.
+        """
+        self.use_fitness_grad = stores_grad_during_fitness
+        self._fitness_gradient_buffer: Dict[str, np.ndarray] = {}
+        self._eq_gradient_buffer: Dict[str, np.ndarray] = {}
+        self._ineq_gradient_buffer: Dict[str, np.ndarray] = {}
+
+    def _store_gradient(self, x: np.ndarray, grad: np.ndarray, where: str):
+        """
+        Store the gradient computed in a fitness computation for later retrieval in the gradient function.
+
+        Note: Numpy arrays cannot be hashed. Pythons hashing adds salt and is therefore not deterministic. This might
+            be problematic for multiprocessing. The use of hashlib circumvents this.
+        """
+        hash_ = hashlib.sha256(x.tobytes()).hexdigest()
+        buffer = {
+            "fitness": self._fitness_gradient_buffer,
+            "eq": self._eq_gradient_buffer,
+            "ineq": self._ineq_gradient_buffer
+        }
+        buffer[where][hash_] = grad
+
+    def _get_gradient(self, x: np.ndarray) -> np.ndarray:
+        """Custom implementation to obtain the gradient of x."""
+        raise NotImplementedError("Custom gradient retrieval not implemented.")
+
+    def _get_buffered_gradient(self, hash_: str) -> np.ndarray:
+        """Custom implementation to obtain the gradient of x."""
+        grads = list()
+        buffers = [self._fitness_gradient_buffer]
+        if self.get_nec() > 0:
+            buffers.append(self._eq_gradient_buffer)
+        if self.get_nic() > 0:
+            buffers.append(self._ineq_gradient_buffer)
+
+        for buffer in buffers:
+            if hash_ not in buffer:
+                raise ValueError("Gradient not stored. Make sure to call _store_gradient during fitness evaluation.")
+            grads.append(buffer[hash_])
+        return np.hstack(grads)
+
+    def gradient(self, x: np.ndarray) -> np.ndarray:
+        """
+        Returns the gradient of the fitness function.
+
+        :param x: The input to the fitness function.
+        :return: The gradient of the fitness function.
+        """
+        if not self.use_fitness_grad:
+            return self._get_gradient(x)
+
+        hash_ = hashlib.sha256(x.tobytes()).hexdigest()
+        return self._get_buffered_gradient(hash_)
+
+
 def optimize_udp(udp: UDP,
                  algo: str = 'auglag',
+                 nlopt_local_algo: str = 'lbfgs',
                  x0: Optional[Collection[np.ndarray]] = None,
                  pop_size: int = 1,
                  verbosity: int = 50,
@@ -139,8 +201,9 @@ def optimize_udp(udp: UDP,
     :param pop_size: The population size.
     :param verbosity: The verbosity level.
     """
-    algo = pg.algorithm(uda=pg.nlopt(algo))
-    algo.extract(pg.nlopt).local_optimizer = pg.nlopt('var2')
+    algo = pg.algorithm(uda = pg.nlopt(algo))
+    if nlopt_local_algo is not None:
+        algo.extract(pg.nlopt).local_optimizer = pg.nlopt('lbfgs')
     algo.set_verbosity(verbosity)
 
     pop = pg.population(prob=udp, size=pop_size)
@@ -153,44 +216,39 @@ def optimize_udp(udp: UDP,
     return algo.evolve(pop)
 
 
-class UdpWithGradient(UDP, ABC):
+def udp_sgd(udp: UdpWithGradient,
+            x0: np.ndarray,
+            step_size: float = 1e-2,
+            num_iter: int = 1000,
+            lambda_constraint: float = 1e2,
+            verbosity: int = 50
+            ):
+    """
+    Stochastic gradient descent for UDPs.
 
-    def __init__(self, stores_grad_during_fitness: bool = True):
-        """
-        A general template for UDPs that provide gradients.
+    :param udp: The UDP to optimize.
+    :param x0: The initial guess.
+    :param step_size: The step size.
+    :param num_iter: The number of iterations.
+    :param lambda_constraint: The constraint multiplier.
+    :param verbosity: The logging interval.
+    """
+    x = x0
+    dim = x0.shape[-1]
+    for i in range(num_iter):
+        vals = udp.fitness(x)
+        f = vals[0]
+        e = vals[1:udp.get_nec() + 1].reshape(udp.get_nec(), 1)
+        if udp.get_nic() != 0:
+            raise NotImplementedError("Gradient descent not implemented for inequality constraints.")
+        g = udp.gradient(x)
+        gf = g[:dim]
+        ge = g[dim:dim*(udp.get_nec() + 1)].reshape(-1, dim)
 
-        :param stores_grad_during_fitness: If True, the gradient is computed during the fitness evaluation and must
-            be stored for later retrieval using _store_gradient. If false, the _get_gradient method must be implemented.
-        """
-        self.use_fitness_grad = stores_grad_during_fitness
-        self._gradient_buffer: Dict[str, np.ndarray] = {}
+        update = step_size * gf
+        update = update + (step_size * ge * e * lambda_constraint).sum(axis=0)
+        x = x - update
 
-    def _store_gradient(self, x: np.ndarray, grad: np.ndarray):
-        """
-        Store the gradient computed in a fitness computation for later retrieval in the gradient function.
-
-        Note: Numpy arrays cannot be hashed. Pythons hashing adds salt and is therefore not deterministic. This might
-            be problematic for multiprocessing. The use of hashlib circumvents this.
-        """
-        hash_ = hashlib.sha256(x.tobytes()).hexdigest()
-        self._gradient_buffer[hash_] = grad
-
-    def _get_gradient(self, x: np.ndarray) -> np.ndarray:
-        """Custom implementation to obtain the gradient of x."""
-        raise NotImplementedError("Custom gradient retrieval not implemented.")
-
-    def gradient(self, x: np.ndarray) -> np.ndarray:
-        """
-        Returns the gradient of the fitness function.
-
-        :param x: The input to the fitness function.
-        :return: The gradient of the fitness function.
-        """
-        if not self.use_fitness_grad:
-            return self._get_gradient(x)
-
-        hash_ = hashlib.sha256(x.tobytes()).hexdigest()
-        if hash_ not in self._gradient_buffer:
-            raise ValueError(f"Gradient for {x} not stored. Make sure to call _store_gradient during fitness "
-                             f"evaluation.")
-        return self._gradient_buffer[hash_]
+        if i % verbosity == 0:
+            print(f"Iteration {i}: f = {f}, e = {e.flatten()}")
+    return x
