@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from abc import ABC
+from abc import ABC, abstractmethod
 from itertools import chain
-from typing import Any, Callable, Iterable, List, Sequence, Tuple, Union
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 from curobo.geom.sdf.world import CollisionCheckerType, WorldCollisionConfig
 from curobo.geom.sdf.world_mesh import WorldMeshCollision
@@ -33,6 +33,7 @@ class Sdf(ABC):
 
     def __init__(self, *args, **kwargs):
         self.callable = self.__error__
+        self._is_accurate = True
 
     def __call__(self,
                  pts: torch.Tensor,
@@ -60,6 +61,10 @@ class Sdf(ABC):
 
         return dist.view(*shape[:-1])
 
+    @property
+    def is_accurate(self) -> bool:
+        return self._is_accurate
+
     @classmethod
     def from_spheres(cls, sph: torch.Tensor):
         """
@@ -79,6 +84,8 @@ class Sdf(ABC):
         """
         Approximates a unitless inertia by checking where in the sampled volume the SDF is positive.
         """
+        if isinstance(dims, torch.Tensor):
+            dims = dims.detach().cpu().numpy()
         scale = (np.mean(dims) / pts_per_dim) ** 3  # Approximates the volume of a single voxel
         grid, d = self.sample(center, dims, pts_per_dim, r)
         mask = d > 0  # Inside
@@ -120,7 +127,7 @@ class Sdf(ABC):
                 return torch.maximum(d1, d2)
             d1, g1 = d1
             d2, g2 = d2
-            return torch.maximum(d1, d2), torch.where(d1 >= d2, g1, g2)
+            return torch.maximum(d1, d2), torch.where((d1 >= d2).unsqueeze(1), g1, g2)
 
         return CallableSdf(query_function)
 
@@ -139,7 +146,7 @@ class Sdf(ABC):
                 return torch.minimum(d1, d2)
             d1, g1 = d1
             d2, g2 = d2
-            return torch.minimum(d1, d2), torch.where(d1 <= d2, g1, g2)
+            return torch.minimum(d1, d2), torch.where((d1 <= d2).unsqueeze(1), g1, g2)
 
         return CallableSdf(query_function)
 
@@ -157,7 +164,7 @@ class Sdf(ABC):
                 return torch.minimum(d1, -d2)
             d1, g1 = d1
             d2, g2 = d2
-            return torch.minimum(d1, -d2), torch.where(d1 <= -d2, g1, g2)
+            return torch.minimum(d1, -d2), torch.where((d1 <= -d2).unsqueeze(1), g1, g2)
 
         return CallableSdf(query_function)
 
@@ -176,21 +183,23 @@ class Sdf(ABC):
                 $\frac{dims}{8^refinement_steps}$. $6$ seems to be a good and reasonably fast default, 7 already takes
                 seconds to compute. Naturally, with one more step, the computation times is multiplied by ~8.
         """
-        dims = torch.tensor(dims)
-        dims = dims + dims.max() / 2 ** (refinement_steps - 1)
+        sph_rad = np.sqrt(3) / 2
+        if not isinstance(dims, torch.Tensor):
+            dims = torch.tensor(dims)
+        dims = dims + dims / 2  # Make sure the centers of all initialized octree spheres are on or inside the SDF
         surface, normals = None, None
         for step in range(refinement_steps):
             query = get_octree_children(center, dims)
             if step < refinement_steps - 1:
                 d = self(query)
-                mask = torch.abs(d) < (dims.max() / 4)
-                center = query[mask][..., :3]
+                mask = torch.abs(d) < sph_rad * dims.max()
                 dims = dims / 2
+                center = query[mask][..., :3]
             else:
                 d, g = self(query, gradients=True)
-                mask = torch.abs(d) < (dims.max() / 4)
+                mask = torch.abs(d) < sph_rad * dims.max()
                 surface = query[mask][..., :3]
-                normals = -g[mask][..., :3] * torch.sign(d[mask]).unsqueeze(-1)
+                normals = g[mask][..., :3] * torch.sign(d[mask]).unsqueeze(-1)
         return surface, normals
 
     def plot(self,
@@ -228,6 +237,26 @@ class Sdf(ABC):
 
         plt.tight_layout()
         plt.show()
+
+    def plot_reconstructed_surface(self,
+                                   center: Optional[torch.Tensor] = None,
+                                   dims: Optional[Iterable[float]] = None,
+                                   refinement_steps: int = 6,
+                                   points_only: bool = False
+                                   ):
+        """Tries to find surface points and normals and construct a mesh from them."""
+        if center is None:
+            raise ValueError(f"Center must be provided to plot an sdf of type {type(self)}.")
+        if dims is None:
+            raise ValueError(f"Dims must be provided to plot an sdf of type {type(self)}.")
+        surface, normals = self.get_surface_points(center, dims, refinement_steps)
+        reconstruction = pv.wrap(surface.detach().cpu().numpy())
+        reconstruction.point_data.active_normals = normals.detach().cpu().numpy()
+        if points_only:
+            surface = reconstruction
+        else:
+            surface = reconstruction.reconstruct_surface()
+        surface.plot()
 
     def pv_plot(self,
                 center: torch.Tensor,
@@ -289,18 +318,63 @@ class Sdf(ABC):
 class CallableSdf(Sdf):
     """This class can implement arbitrarily complex SDFs."""
 
-    def __init__(self, query_function: Callable[[torch.Tensor, bool], torch.Tensor]):
+    def __init__(self,
+                 query_function: Callable[[torch.Tensor, bool], torch.Tensor],
+                 is_accurate: bool = False
+                 ):
+        """
+        Args:
+            query_function: A function that takes a tensor of points and returns the signed distance to the SDF.
+            is_accurate: Whether the SDF is accurate. If False, the SDF provided by the query function is only an
+                approximation. This commonly happens when combining SDFs, e.g., via boolean operations. See also:
+                https://iquilezles.org/articles/interiordistance/
+        """
+        self._is_accurate = is_accurate
         super().__init__()
         self.callable = query_function
 
 
-class CuroboMeshSdf(Sdf):
+class BoundedSdf(Sdf, ABC):
+    """An SDF that is aware of its boundaries."""
+
+    @abstractmethod
+    def get_center(self) -> torch.Tensor:
+        """Returns the center of the SDF."""
+
+    @abstractmethod
+    def get_dims(self) -> torch.Tensor:
+        """Returns the dimensions of the SDF."""
+
+    def pv_plot(self,
+                center: Optional[torch.Tensor] = None,
+                dims: Optional[Sequence[float]] = None,
+                pts_per_dim: int = 60,
+                hide_threshold: float = 0.0
+                ):
+        """Adds defaults to the super class plot method."""
+        center = center if center is not None else self.get_center()
+        dims = dims if dims is not None else self.get_dims()
+        return super().pv_plot(center, dims, pts_per_dim, hide_threshold)
+
+    def plot_reconstructed_surface(self,
+                                   center: Optional[torch.Tensor] = None,
+                                   dims: Optional[Iterable[float]] = None,
+                                   **kwargs
+                                   ):
+        if center is None:
+            center = self.get_center()
+        if dims is None:
+            dims = self.get_dims()
+        return super().plot_reconstructed_surface(center, dims, **kwargs)
+
+class CuroboMeshSdf(BoundedSdf):
     """A signed distance function representing a curobo mesh."""
 
     def __init__(self, world_collision_model: WorldMeshCollision):
         super().__init__()
         self.wcm: WorldMeshCollision = world_collision_model
         self.callable = self._callable
+        self._is_accurate = False
 
     def _callable(self, pts: torch.Tensor, gradients: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if gradients:
@@ -330,10 +404,12 @@ class CuroboMeshSdf(Sdf):
     def discretize(self, pts_per_dim: int) -> SphereSdf:
         """
         Returns a discretized version of the SDF.
+
+        TODO: This can be implemented using an octree-like structure similar to the surface detection.
         """
         center = self.get_center()
         dims = self.get_dims()
-        r = dims.max() / pts_per_dim
+        r = 2 ** .5 * dims.max() / pts_per_dim
         grid, d = self.sample(center, dims, pts_per_dim, r=r)
         include = d >= 0
 
@@ -384,13 +460,35 @@ class CuroboMeshSdf(Sdf):
         return poses
 
 
-class SphereSdf(Sdf):
+class SphereSdf(BoundedSdf):
     """A signed distance function representing a collection of spheres."""
 
     def __init__(self, sph: torch.Tensor):
         super().__init__()
         self.sph = sph
         self.callable = self._callable
+
+    @property
+    def aabb(self) -> torch.Tensor:
+        """Returns the axis-aligned bounding box of the SDF."""
+        sph = self.sph.view(-1, 4)[:, :3]
+        bb = torch.tensor([
+            [sph[:, 0].min(), sph[:, 1].min(), sph[:, 2].min()],
+            [sph[:, 0].max(), sph[:, 1].max(), sph[:, 2].max()]
+        ])
+        r = self.sph[..., 3].max()
+        bb[0] -= r
+        bb[1] += r
+        return bb
+
+    @property
+    def is_accurate(self):
+        """
+        SphereSdf is accurate only for a single sphere. As multiple spheres are considered a boolean union it becomes
+        an approximation in this case.
+        """
+        return self.sph.shape[0] == 1
+
 
     def boolean_union(self, other: Sdf) -> Sdf:
         """
@@ -405,16 +503,27 @@ class SphereSdf(Sdf):
         sph = torch.concat([self.sph, other.sph], dim=0)
         return SphereSdf(sph)
 
+    def get_center(self) -> torch.Tensor:
+        """Approximates the center of the SDF"""
+        return self.aabb.mean(dim=0)
+
+    def get_dims(self) -> torch.Tensor:
+        """Approximates the dimensions of the SDF"""
+        return self.aabb[1] - self.aabb[0]
+
     def _callable(self, pts: torch.Tensor, gradients: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if gradients:
-            raise NotImplementedError("Gradients are not yet implemented for SphereSdf.")
         if pts.shape[-1] == 4:
             r = pts[..., 3]
             pts = pts[..., :3]
         else:
             r = torch.zeros(pts.shape[:-1], device=pts.device)
-        d, idx = torch.min(torch.linalg.norm(pts[..., None, :] - self.sph[..., :3], dim=-1), dim=-1)
+        deltas = pts[..., None, :] - self.sph[..., :3]
+        d, idx = torch.min(torch.linalg.norm(deltas, dim=-1), dim=-1)
         d = d - self.sph[idx, 3] - r
+        if gradients:
+            grads = torch.concat([-deltas[torch.arange(deltas.shape[0]), idx],
+                                  torch.zeros((deltas.shape[0], 1)).to(deltas)], dim=-1)
+            return -d, grads
         return -d
 
 

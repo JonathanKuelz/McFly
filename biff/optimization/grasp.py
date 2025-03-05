@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from biff.optimization.pygmo import UdpWithGradient
-from mcfly.utilities.sdf import CuroboMeshSdf, SphereSdf
+from mcfly.utilities.sdf import CuroboMeshSdf, Sdf, SphereSdf
 
 class MoveToContactPoint(UdpWithGradient):
     """
@@ -93,12 +93,12 @@ class MoveToContactPoint(UdpWithGradient):
         hash_ = hashlib.sha256(x.tobytes()).hexdigest()
         if hash_ not in self._query_cache:
             pos = torch.tensor(x, dtype=torch.float32)
-            self._translate_mesh(pos)
+            self._translate_mesh_to(pos)
             d, g = self.moveable_sdf(self.static_sdf.sph, gradients=True)
             self._query_cache[hash_] = (d, g)
         return self._query_cache[hash_]
 
-    def _translate_mesh(self, new_pos: torch.Tensor):
+    def _translate_mesh_to(self, new_pos: torch.Tensor):
         """Places the mesh at the new position."""
         for name, ref in self._start_poses.items():
             new_pos = ref[:3] + new_pos
@@ -111,24 +111,80 @@ class MoveToContactPoint(UdpWithGradient):
     def get_nec(self) -> int:
         return 2 if self.move_direction is not None else 1
 
-    # def generate(self) -> UdpWithGradient:
-    #     """
-    #     pygmo requires deepcopy-able objects. This class is not, due to the CuRobo SDF references. This method
-    #     returns a deepcopy-able functional copy of this class.
-    #     """
-    #     this = self
-    #     class _UDP(UdpWithGradient):
-    #
-    #         def _eval_fitness(self, x: np.ndarray) -> np.ndarray:
-    #             return this._eval_fitness(x)
-    #
-    #         def _eval_equality_constraints(self, x: np.ndarray) -> Optional[np.ndarray]:
-    #             return this._eval_equality_constraints(x)
-    #
-    #         def get_bounds(self) -> Tuple[List[float], List[float]]:
-    #             return this.get_bounds()
-    #
-    #         def get_nec(self) -> int:
-    #             return this.get_nec()
-    #
-    #     return _UDP()
+
+class DeformGrasp(MoveToContactPoint):
+    
+    def __init__(self,
+                 finger: CuroboMeshSdf,
+                 workpiece: SphereSdf,
+                 bounds: Union[float, np.ndarray],
+                 *,
+                 resolution: int = 60,
+                 ):
+        super().__init__(finger, workpiece, bounds)
+        self.resolution = resolution
+        self._base_inertia = self.__get_inertia(workpiece)
+        self._gripper_surface_pts = self.__get_surface(finger)[0].shape[0]
+
+    def _eval_fitness(self, x: np.ndarray) -> np.ndarray:
+        f, g = self._query(x)
+        self._store_gradient(x, g.detach().cpu().numpy(), where="fitness")
+        return f.detach().cpu().numpy()
+
+    def _grasp_quality(self, obj: Sdf) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Grasp quality increases with the surface area of the object."""
+        surface, _ = self.__get_surface(obj)
+        _, g = self.moveable_sdf(self.static_sdf.sph, gradients=True)
+        contact_points = surface.shape[0]
+        quality = torch.tensor([contact_points / self._gripper_surface_pts])
+        return quality, g[..., :3].mean(dim=0)
+
+    def _query(self, x: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+        hash_ = hashlib.sha256(x.tobytes()).hexdigest()
+        if hash_ not in self._query_cache:
+            pos = torch.tensor(x, dtype=torch.float32)
+            self._translate_mesh_to(pos)
+            carved = self.static_sdf.boolean_difference(self.moveable_sdf)
+            intersected = self.static_sdf.boolean_intersection(self.moveable_sdf)
+            fo, go = self._object_quality(carved)
+            fg, gg = self._grasp_quality(intersected)
+            f = torch.hstack([fo, fg])
+            g = torch.hstack([go, gg])
+            self._query_cache[hash_] = (f, g)
+        return self._query_cache[hash_]
+
+    def _object_quality(self, obj: Sdf) -> Tuple[torch.Tensor, torch.Tensor]:
+        inertia = self.__get_inertia(obj)
+        delta = inertia - self._base_inertia
+        c1, c2, c3 = delta[0, 1].abs(), delta[1, 0].abs(), delta[2, 0].abs()
+        quality = -sum((c1, c2, c3))
+        # Assuming we are carving out in the first quadrant, the quality increases with xyz, so the gradient is positive
+        grad = self.__inertia_gradient(c1, c2, c3).nan_to_num(nan=0, posinf=0, neginf=0)
+        return quality, grad
+
+    def __get_inertia(self, obj: Sdf) -> torch.Tensor:
+        center = self.static_sdf.get_center()
+        dims = self.static_sdf.get_dims()
+        return obj.approximate_inertia(center, dims, self.resolution)
+
+    def __get_surface(self, obj: Sdf) -> Tuple[torch.Tensor, torch.Tensor]:
+        center = self.moveable_sdf.get_center()
+        dims = self.moveable_sdf.get_dims()
+        return obj.get_surface_points(center, dims)
+
+    @staticmethod
+    def __inertia_gradient(c1, c2, c3) -> torch.tensor:
+        """
+        Returns the absolute of the gradient  for the loss given by sum(c1, c2, c3), considering:
+        xy = c1
+        xz = c2
+        yz = c3
+        """
+        return torch.tensor([
+            (c2 * c3) / c1,
+            (c1 * c3) / c2,
+            (c1 * c2) / c3,
+        ])
+    
+    def get_nec(self) -> int:
+        return 0

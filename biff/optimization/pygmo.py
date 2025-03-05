@@ -234,21 +234,25 @@ def udp_sgd(udp: UdpWithGradient,
     :param verbosity: The logging interval.
     """
     x = x0
+    f0 = udp.fitness(x)
+    neq = udp.get_nec()
+    niq = udp.get_nic()
+    nf = len(f0) - neq - niq
     dim = x0.shape[-1]
     for i in range(num_iter):
         vals = udp.fitness(x)
-        f = vals[0]
-        e = vals[1:udp.get_nec() + 1].reshape(udp.get_nec(), 1)
-        if udp.get_nic() != 0:
+        f = vals[:nf]
+        e = vals[nf:nf + udp.get_nec()].reshape(neq, 1)
+        if niq != 0:
             raise NotImplementedError("Gradient descent not implemented for inequality constraints.")
         g = udp.gradient(x)
-        gf = g[:dim]
-        ge = g[dim:dim*(udp.get_nec() + 1)].reshape(-1, dim)
+        gf = g[:dim * nf].reshape(-1, dim)
+        ge = g[dim * nf:dim * (udp.get_nec() + nf)].reshape(-1, dim)
 
-        update = step_size * gf
+        update = step_size * gf.sum(axis=0)
         update = update + (step_size * ge * e * lambda_constraint).sum(axis=0)
         x = x - update
 
         if i % verbosity == 0:
-            print(f"Iteration {i}: f = {f}, e = {e.flatten()}")
+            print(f"Iteration {i}: x = {x}, f = {f}, e = {e.flatten()}")
     return x

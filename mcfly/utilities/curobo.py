@@ -65,11 +65,16 @@ def get_sdf(
                 gradients = torch.zeros(d.numel(), 4, device=device)
                 gradients[:, :3] = direction
         else:
+            rad = spheres[..., 3].clone()  # CuRobo seems to ignore this???
+            new_spheres = spheres.detach().clone()
+            new_spheres[..., 3] = 0.
+            spheres = new_spheres.requires_grad_(spheres.requires_grad)
             query_buffer = CollisionQueryBuffer.initialize_from_shape(spheres.shape, TensorDeviceType(),
                                                                       {t: True for t in collision_types})
             d = world_collision.get_sphere_distance(spheres, query_buffer, weight=torch.tensor([1.], device=device),
                                                     activation_distance=torch.tensor([activation_distance], device=device),
                                                     compute_esdf=True)
+            d = d + rad
             if spheres.requires_grad:
                 gradients = query_buffer.get_gradient_buffer().squeeze()
 
