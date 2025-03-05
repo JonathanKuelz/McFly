@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from abc import ABC
 from itertools import chain
-from typing import Any, Callable, Iterable, List, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Sequence, Tuple, Union
 
-from curobo.geom.sdf.world import CollisionCheckerType, WorldCollision, WorldCollisionConfig
+from curobo.geom.sdf.world import CollisionCheckerType, WorldCollisionConfig
 from curobo.geom.sdf.world_mesh import WorldMeshCollision
+from curobo.geom.transform import pose_inverse
 from curobo.geom.types import Mesh, WorldConfig
 from curobo.types.base import TensorDeviceType
+from curobo.types.math import Pose
 import matplotlib.pyplot as plt
 import numpy as np
 import pyvista as pv
@@ -16,7 +19,7 @@ from tqdm import tqdm
 from mcfly.utilities.curobo import get_sdf
 
 
-class Sdf:
+class Sdf(ABC):
     """
     A wrapper that can be used to query signed distance fields.
 
@@ -31,16 +34,29 @@ class Sdf:
     def __init__(self, *args, **kwargs):
         self.callable = self.__error__
 
-    def __call__(self, pts: torch.Tensor, quiet: bool = True) -> torch.Tensor:
+    def __call__(self,
+                 pts: torch.Tensor,
+                 gradients: bool = False,
+                 quiet: bool = True,
+                 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Returns the signed distance from the SDF to the given points."""
         shape = pts.shape
         pt_dim = shape[-1]
         query = pts.view(-1, pt_dim)
         dist = torch.empty(query.shape[0], device=query.device)
+        grad = torch.empty_like(query)
 
         splits = torch.split(query, self.max_query_size)
         for i, split in enumerate(tqdm(splits, disable=quiet or len(splits) < 20)):
-            dist[i * self.max_query_size:(i + 1) * self.max_query_size] = self.callable(split)
+            if gradients:
+                d, g = self.callable(split, gradients=True)
+                dist[i * self.max_query_size:(i + 1) * self.max_query_size] = d
+                grad[i * self.max_query_size:(i + 1) * self.max_query_size] = g
+            else:
+                dist[i * self.max_query_size:(i + 1) * self.max_query_size] = self.callable(split, gradients=False)
+
+        if gradients:
+            return dist.view(*shape[:-1]), grad.view(*shape)
 
         return dist.view(*shape[:-1])
 
@@ -97,8 +113,14 @@ class Sdf:
         SDF B and SDF A.
         """
 
-        def query_function(pts: torch.Tensor) -> torch.Tensor:
-            return torch.maximum(self(pts, quiet=True), other(pts, quiet=True))
+        def query_function(pts: torch.Tensor, gradients: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            d1 = self(pts, gradients, quiet=True)
+            d2 = other(pts, gradients, quiet=True)
+            if not gradients:
+                return torch.maximum(d1, d2)
+            d1, g1 = d1
+            d2, g2 = d2
+            return torch.maximum(d1, d2), torch.where(d1 >= d2, g1, g2)
 
         return CallableSdf(query_function)
 
@@ -110,8 +132,14 @@ class Sdf:
         subtracting SDF B from SDF A.
         """
 
-        def query_function(pts: torch.Tensor) -> torch.Tensor:
-            return torch.minimum(self(pts, quiet=True), other(pts, quiet=True))
+        def query_function(pts: torch.Tensor, gradients: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            d1 = self(pts, gradients, quiet=True)
+            d2 = other(pts, gradients, quiet=True)
+            if not gradients:
+                return torch.minimum(d1, d2)
+            d1, g1 = d1
+            d2, g2 = d2
+            return torch.minimum(d1, d2), torch.where(d1 <= d2, g1, g2)
 
         return CallableSdf(query_function)
 
@@ -122,12 +150,48 @@ class Sdf:
         Given two SDFs, A and B, this will result in a SDF the represents a geometry that would result when
         subtracting SDF B from SDF A.
         """
-
-        def query_function(pts: torch.Tensor) -> torch.Tensor:
-            return torch.minimum(self(pts, quiet=True), -other(pts, quiet=True))
+        def query_function(pts: torch.Tensor, gradients: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            d1 = self(pts, gradients, quiet=True)
+            d2 = other(pts, gradients, quiet=True)
+            if not gradients:
+                return torch.minimum(d1, -d2)
+            d1, g1 = d1
+            d2, g2 = d2
+            return torch.minimum(d1, -d2), torch.where(d1 <= -d2, g1, g2)
 
         return CallableSdf(query_function)
 
+    def get_surface_points(self,
+                           center: torch.Tensor,
+                           dims: Iterable[float],
+                           refinement_steps: int = 6,
+                           ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns the points and their normals of the SDF.
+
+        Args:
+            center: The (approximate) center of the SDF.
+            dims: The dimensions of the cube to use to sample the SDF.
+            refinement_steps: How many times to refine the grid. The final resolution of the grid will be
+                $\frac{dims}{8^refinement_steps}$. $6$ seems to be a good and reasonably fast default, 7 already takes
+                seconds to compute. Naturally, with one more step, the computation times is multiplied by ~8.
+        """
+        dims = torch.tensor(dims)
+        dims = dims + dims.max() / 2 ** (refinement_steps - 1)
+        surface, normals = None, None
+        for step in range(refinement_steps):
+            query = get_octree_children(center, dims)
+            if step < refinement_steps - 1:
+                d = self(query)
+                mask = torch.abs(d) < (dims.max() / 4)
+                center = query[mask][..., :3]
+                dims = dims / 2
+            else:
+                d, g = self(query, gradients=True)
+                mask = torch.abs(d) < (dims.max() / 4)
+                surface = query[mask][..., :3]
+                normals = -g[mask][..., :3] * torch.sign(d[mask]).unsqueeze(-1)
+        return surface, normals
 
     def plot(self,
              center: torch.Tensor,
@@ -198,8 +262,12 @@ class Sdf:
                center: torch.Tensor,
                dims: Iterable[float],
                pts_per_dim: int,
-               r: float = 0.0
-               ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+               r: float = 0.0,
+               gradients: bool = False
+               ) -> Union[
+                    Tuple[List[torch.Tensor], torch.Tensor],
+                    Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]
+                    ]:
         """
         Samples the SDF at a grid of points.
         """
@@ -212,13 +280,16 @@ class Sdf:
         points = torch.stack(grid, dim=-1)
         if r > 0:
             points = torch.concatenate([points, torch.ones((*points.shape[:-1], 1), device=points.device) * r], dim=-1)
+        if gradients:
+            d, g = self(points, gradients=True)
+            return grid, d, g
         d = self(points)
         return grid, d
 
 class CallableSdf(Sdf):
     """This class can implement arbitrarily complex SDFs."""
 
-    def __init__(self, query_function: Callable[[torch.Tensor], torch.Tensor]):
+    def __init__(self, query_function: Callable[[torch.Tensor, bool], torch.Tensor]):
         super().__init__()
         self.callable = query_function
 
@@ -231,11 +302,15 @@ class CuroboMeshSdf(Sdf):
         self.wcm: WorldMeshCollision = world_collision_model
         self.callable = self._callable
 
-    def _callable(self, pts: torch.Tensor) -> torch.Tensor:
+    def _callable(self, pts: torch.Tensor, gradients: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if gradients:
+            pts.requires_grad = True
         if pts.shape[-1] == 3:
             pts = torch.concatenate([pts, torch.zeros((*pts.shape[:-1], 1), device=pts.device)], dim=-1)
         query_spheres = {'query_spheres': pts.view(1, 1, -1, 4)}
         sdf_info = get_sdf(query_spheres, self.wcm)
+        if gradients:
+            return sdf_info['query_spheres'].distances, sdf_info['query_spheres'].grad
         return sdf_info['query_spheres'].distances
 
     @classmethod
@@ -256,9 +331,8 @@ class CuroboMeshSdf(Sdf):
         """
         Returns a discretized version of the SDF.
         """
-        vertices = torch.tensor(list(chain.from_iterable(m.vertices for m in self.wcm.world_model.mesh)))
-        center = (torch.max(vertices, dim=0)[0] + torch.min(vertices, dim=0)[0]) / 2
-        dims = torch.max(vertices, dim=0)[0] - torch.min(vertices, dim=0)[0]
+        center = self.get_center()
+        dims = self.get_dims()
         r = dims.max() / pts_per_dim
         grid, d = self.sample(center, dims, pts_per_dim, r=r)
         include = d >= 0
@@ -266,6 +340,27 @@ class CuroboMeshSdf(Sdf):
         pts = torch.stack(grid, dim=-1)[include]
         r = torch.ones(pts.shape[:-1], device=pts.device) * r
         return SphereSdf(torch.concat([pts, r[..., None]], dim=-1))
+
+    def get_center(self) -> torch.Tensor:
+        """Approximates the center of the SDF"""
+        vertices = torch.tensor(list(chain.from_iterable(m.vertices for m in self.wcm.world_model.mesh)))
+        return (torch.max(vertices, dim=0)[0] + torch.min(vertices, dim=0)[0]) / 2
+
+    def get_dims(self) -> torch.Tensor:
+        """Approximates the dimensions of the SDF"""
+        vertices = torch.tensor(list(chain.from_iterable(m.vertices for m in self.wcm.world_model.mesh)))
+        return torch.max(vertices, dim=0)[0] - torch.min(vertices, dim=0)[0]
+
+    def translate(self, t: torch.Tensor):
+        """Translates the whole SDF by t."""
+        poses = {
+            name: pose for name, pose in zip(self.mesh_names, self.mesh_poses)
+        }
+        for mesh, pose in poses.items():
+            p = pose[:3] + t
+            quat = pose[3:]
+            new_pose = Pose(p, quat)
+            self.wcm.update_mesh_pose(w_obj_pose=new_pose, name=mesh)
 
     @property
     def meshes(self) -> List[Mesh]:
@@ -276,8 +371,15 @@ class CuroboMeshSdf(Sdf):
         return [m.name for m in self.wcm.world_model.mesh]
 
     @property
-    def mesh_poses(self) -> List[List[float]]:
-        return [m.pose for m in self.wcm.world_model.mesh]
+    def mesh_poses(self) -> List[torch.Tensor]:
+        env_idx = 0
+        inv = [self.wcm._mesh_tensor_list[1][env_idx, self.wcm.get_mesh_idx(m, env_idx), :7] for m in self.mesh_names]
+        poses = list()
+        for ip in inv:
+            p, quat = pose_inverse(ip[:3], ip[3:])
+            poses.append(torch.cat([p, quat]))
+        return poses
+
 
 class SphereSdf(Sdf):
     """A signed distance function representing a collection of spheres."""
@@ -300,7 +402,9 @@ class SphereSdf(Sdf):
         sph = torch.concat([self.sph, other.sph], dim=0)
         return SphereSdf(sph)
 
-    def _callable(self, pts: torch.Tensor) -> torch.Tensor:
+    def _callable(self, pts: torch.Tensor, gradients: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if gradients:
+            raise NotImplementedError("Gradients are not yet implemented for SphereSdf.")
         if pts.shape[-1] == 4:
             r = pts[..., 3]
             pts = pts[..., :3]
@@ -309,3 +413,24 @@ class SphereSdf(Sdf):
         d, idx = torch.min(torch.linalg.norm(pts[..., None, :] - self.sph[..., :3], dim=-1), dim=-1)
         d = d - self.sph[idx, 3] - r
         return -d
+
+
+def get_octree_children(c: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+    """Assuming a center c and box dimensions d, this returns the 8 children of the box octree."""
+    radius = d.max() / 4
+    if c.dim() == 1:
+        c = c.unsqueeze(0)
+    children = c.unsqueeze(1).repeat_interleave(8, dim=1)
+    offset = torch.tensor([
+        [1, 1, 1],
+        [1, 1, -1],
+        [1, -1, 1],
+        [1, -1, -1],
+        [-1, 1, 1],
+        [-1, 1, -1],
+        [-1, -1, 1],
+        [-1, -1, -1]
+    ]) * d / 4
+    pts = (children + offset).view(-1, 3)
+    spheres = torch.concatenate([pts, torch.ones((pts.shape[0], 1), device=pts.device) * radius], dim=-1)
+    return spheres

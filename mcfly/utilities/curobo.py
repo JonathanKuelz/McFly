@@ -2,18 +2,24 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
 
 from curobo.geom.sdf.world import CollisionQueryBuffer, WorldCollision
-from curobo.geom.sdf.world_mesh import WorldMeshCollision
 from curobo.geom.types import Mesh, Sphere
 from curobo.types.base import TensorDeviceType
+from curobo.types.math import Pose
 import torch
 import trimesh
 
+
+UNIT_QUATERNION = torch.tensor([1., 0., 0., 0.], dtype=torch.float32)
 
 @dataclass
 class SdfInfo:
     distances: torch.Tensor
     spheres: torch.Tensor
     grad: Optional[torch.Tensor] = None
+
+def pose_from_translation(p: torch.Tensor) -> Pose:
+    """Creates a pose from a translation vector."""
+    return Pose(p, UNIT_QUATERNION.clone())
 
 def get_sdf(
     query_spheres: Dict[str, torch.Tensor],
