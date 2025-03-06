@@ -7,7 +7,7 @@ import torch
 
 from biff.geometry.boolean_ball_sdf import make_finger_mesh, plot_inertia_deltas
 from biff.optimization.grasp import DeformGrasp, MoveToContactPoint
-from biff.optimization.pygmo import optimize_udp, udp_sgd
+from biff.optimization.pygmo import optimize_udp, scipy_udp, udp_sgd
 from docbrown.utilities.geometry import pv_to_trimesh
 from mcfly.utilities.curobo import get_sdf, trimesh_to_curobo_mesh
 from mcfly.utilities.sdf import CuroboMeshSdf, SphereSdf
@@ -25,7 +25,7 @@ def main(discretize: bool = False):
     sphere_mesh = trimesh_to_curobo_mesh(pv_to_trimesh(pv.Sphere(radius=r)), 'object')
     sphere_sdf = CuroboMeshSdf.from_meshes([sphere_mesh], max_distance=r)
 
-    query_spheres = sphere_sdf.discretize(100)
+    query_spheres = sphere_sdf.discretize(pts_per_dim=100)
 
     project_onto = torch.tensor([1., 0, 0], dtype=torch.float32)
 
@@ -52,8 +52,9 @@ def main(discretize: bool = False):
     # Second step: Move inwards, optimizing arbitrary objectives
     finger_position = rf_sdf.mesh_poses[0][:3].detach().cpu().numpy()
     # Note that the new UDP class will assume the current mesh position to be the zero position
-    p_deform = DeformGrasp(rf_sdf, query_spheres, bounds=np.array([-.5, .1]))
+    p_deform = DeformGrasp(rf_sdf, query_spheres, bounds=np.array([-.5, .1]), weighting=np.array([1., 1.]))
     udp_sgd(p_deform, x0=np.array([0., 0., 0.]), step_size=1e-2, num_iter=500)
+    res = scipy_udp(p_deform, method='trust-ncg', x0=np.array([0., 0., 0.]))
 
 
 if __name__ == '__main__':

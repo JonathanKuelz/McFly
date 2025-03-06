@@ -71,7 +71,8 @@ def get_sdf(
             spheres = new_spheres.requires_grad_(spheres.requires_grad)
             query_buffer = CollisionQueryBuffer.initialize_from_shape(spheres.shape, TensorDeviceType(),
                                                                       {t: True for t in collision_types})
-            d = world_collision.get_sphere_distance(spheres, query_buffer, weight=torch.tensor([1.], device=device),
+            d = world_collision.get_sphere_distance(spheres.to(torch.float32), query_buffer,
+                                                    weight=torch.tensor([1.], device=device),
                                                     activation_distance=torch.tensor([activation_distance], device=device),
                                                     compute_esdf=True)
             d = d + rad

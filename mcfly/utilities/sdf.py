@@ -12,6 +12,8 @@ from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
 import matplotlib.pyplot as plt
 import numpy as np
+import open3d as o3d
+import pymeshfix
 import pyvista as pv
 import torch
 from tqdm import tqdm
@@ -168,6 +170,23 @@ class Sdf(ABC):
 
         return CallableSdf(query_function)
 
+    def discretize(self,
+                   center: torch.Tensor,
+                   dims: Iterable[float],
+                   pts_per_dim: int) -> SphereSdf:
+        """
+        Returns a discretized version of the SDF.
+
+        TODO: This can be implemented using an octree-like structure similar to the surface detection.
+        """
+        r = 2 ** .5 * dims.max() / pts_per_dim
+        grid, d = self.sample(center, dims, pts_per_dim, r=r)
+        include = d >= 0
+
+        pts = torch.stack(grid, dim=-1)[include]
+        r = torch.ones(pts.shape[:-1], device=pts.device) * r
+        return SphereSdf(torch.concat([pts, r[..., None]], dim=-1))
+
     def get_surface_points(self,
                            center: torch.Tensor,
                            dims: Iterable[float],
@@ -242,21 +261,16 @@ class Sdf(ABC):
                                    center: Optional[torch.Tensor] = None,
                                    dims: Optional[Iterable[float]] = None,
                                    refinement_steps: int = 6,
-                                   points_only: bool = False
                                    ):
         """Tries to find surface points and normals and construct a mesh from them."""
         if center is None:
             raise ValueError(f"Center must be provided to plot an sdf of type {type(self)}.")
         if dims is None:
             raise ValueError(f"Dims must be provided to plot an sdf of type {type(self)}.")
-        surface, normals = self.get_surface_points(center, dims, refinement_steps)
-        reconstruction = pv.wrap(surface.detach().cpu().numpy())
-        reconstruction.point_data.active_normals = normals.detach().cpu().numpy()
-        if points_only:
-            surface = reconstruction
-        else:
-            surface = reconstruction.reconstruct_surface()
-        surface.plot()
+        v, f = self.reconstruct_surface_poisson(center, dims, refinement_steps)
+        faces = np.hstack([np.full((f.shape[0], 1), 3), f])
+        pv_mesh = pv.PolyData(v.astype(np.float32), faces)
+        pv_mesh.plot()
 
     def pv_plot(self,
                 center: torch.Tensor,
@@ -286,6 +300,35 @@ class Sdf(ABC):
                 point_size=10 / scale,
                 show_scalar_bar=False
                 )
+
+    def reconstruct_surface_poisson(self,
+                                    center: Optional[torch.Tensor] = None,
+                                    dims: Optional[Iterable[float]] = None,
+                                    refinement_steps: int = 6,
+                                    fix_mesh: bool = True
+                                    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Tries to reconstrunct the surface by sampling the SDF and using Poisson reconstruction.
+
+        original code: https://github.com/mkazhdan/PoissonRecon
+        see also: https://www.open3d.org/docs/latest/tutorial/Advanced/surface_reconstruction.html
+        Args:
+            center: The (approximate) center of the SDF.
+            dims: The dimensions of the cube to use to sample the SDF.
+            refinement_steps: How many times to refine the grid AND the reconstruction. The final resolution of the grid
+            will be $\frac{dims}{8^refinement_steps}$. $6$ seems to be a good and reasonably fast default.
+            fix_mesh: Whether to fix the mesh after reconstruction. This is recommended, but takes additional time.
+        Returns: (vertices, faces)
+        """
+        points, normals = self.get_surface_points(center, dims, refinement_steps=refinement_steps)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.detach().cpu().numpy())
+        pcd.normals = o3d.utility.Vector3dVector(normals.detach().cpu().numpy())
+        surface, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd=pcd, depth=refinement_steps)
+        v, f = np.asarray(surface.vertices), np.asarray(surface.triangles)
+        if fix_mesh:
+            v, f = pymeshfix.clean_from_arrays(v, f)
+        return v, f
 
     def sample(self,
                center: torch.Tensor,
@@ -345,6 +388,25 @@ class BoundedSdf(Sdf, ABC):
     def get_dims(self) -> torch.Tensor:
         """Returns the dimensions of the SDF."""
 
+    def discretize(self,
+                   center: Optional[torch.Tensor] = None,
+                   dims: Optional[Iterable[float]] = None,
+                   pts_per_dim: Optional[int] = 60) -> SphereSdf:
+        """Returns a discretized version of the SDF."""
+        center = self.get_center() if center is None else center
+        dims = self.get_dims() if dims is None else dims
+        return super().discretize(center, dims, pts_per_dim)
+
+    def get_surface_points(self,
+                           center: Optional[torch.Tensor] = None,
+                           dims: Optional[Iterable[float]] = None,
+                           refinement_steps: int = 6,
+                           ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns the points and their normals of the SDF."""
+        center = self.get_center() if center is None else center
+        dims = self.get_dims() if dims is None else dims
+        return super().get_surface_points(center, dims, refinement_steps)
+
     def pv_plot(self,
                 center: Optional[torch.Tensor] = None,
                 dims: Optional[Sequence[float]] = None,
@@ -361,11 +423,18 @@ class BoundedSdf(Sdf, ABC):
                                    dims: Optional[Iterable[float]] = None,
                                    **kwargs
                                    ):
-        if center is None:
-            center = self.get_center()
-        if dims is None:
-            dims = self.get_dims()
+        center = self.get_center() if center is None else center
+        dims = self.get_dims() if dims is None else dims
         return super().plot_reconstructed_surface(center, dims, **kwargs)
+
+    def reconstruct_surface_poisson(self,
+                                    center: Optional[torch.Tensor] = None,
+                                    dims: Optional[Iterable[float]] = None,
+                                    refinement_steps: int = 6
+                                    ) -> o3d.geometry.TriangleMesh:
+        center = self.get_center() if center is None else center
+        dims = self.get_dims() if dims is None else dims
+        return super().reconstruct_surface_poisson(center, dims, refinement_steps)
 
 class CuroboMeshSdf(BoundedSdf):
     """A signed distance function representing a curobo mesh."""
@@ -400,22 +469,6 @@ class CuroboMeshSdf(BoundedSdf):
         )
         world_collision = WorldMeshCollision(ccfg)
         return cls(world_collision)
-
-    def discretize(self, pts_per_dim: int) -> SphereSdf:
-        """
-        Returns a discretized version of the SDF.
-
-        TODO: This can be implemented using an octree-like structure similar to the surface detection.
-        """
-        center = self.get_center()
-        dims = self.get_dims()
-        r = 2 ** .5 * dims.max() / pts_per_dim
-        grid, d = self.sample(center, dims, pts_per_dim, r=r)
-        include = d >= 0
-
-        pts = torch.stack(grid, dim=-1)[include]
-        r = torch.ones(pts.shape[:-1], device=pts.device) * r
-        return SphereSdf(torch.concat([pts, r[..., None]], dim=-1))
 
     def get_center(self) -> torch.Tensor:
         """Approximates the center of the SDF"""

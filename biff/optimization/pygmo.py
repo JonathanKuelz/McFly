@@ -5,7 +5,7 @@ from typing import Collection, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pygmo as pg
-
+from scipy.optimize import minimize, OptimizeResult
 
 class ReferenceCloneClass(type):
     """
@@ -216,8 +216,21 @@ def optimize_udp(udp: UDP,
     return algo.evolve(pop)
 
 
+def scipy_udp(udp: UdpWithGradient,
+              method: str,
+              x0: np.ndarray) -> OptimizeResult:
+
+    def func(x):
+        return udp.fitness(x)[0]
+
+    def jac(x, *args):
+        return udp.gradient(x)
+
+    return minimize(func, x0, jac=jac, method=method)
+
 def udp_sgd(udp: UdpWithGradient,
             x0: np.ndarray,
+            fitness_weights: Optional[np.ndarray] = None,
             step_size: float = 1e-2,
             num_iter: int = 1000,
             lambda_constraint: float = 1e2,
@@ -228,6 +241,7 @@ def udp_sgd(udp: UdpWithGradient,
 
     :param udp: The UDP to optimize.
     :param x0: The initial guess.
+    :param fitness_weights: The weights for the fitness function.
     :param step_size: The step size.
     :param num_iter: The number of iterations.
     :param lambda_constraint: The constraint multiplier.
@@ -238,6 +252,10 @@ def udp_sgd(udp: UdpWithGradient,
     neq = udp.get_nec()
     niq = udp.get_nic()
     nf = len(f0) - neq - niq
+    if fitness_weights is None:
+        fitness_weights = np.ones(nf)
+    fitness_weights = fitness_weights.reshape(-1, 1)
+
     dim = x0.shape[-1]
     for i in range(num_iter):
         vals = udp.fitness(x)
@@ -249,7 +267,7 @@ def udp_sgd(udp: UdpWithGradient,
         gf = g[:dim * nf].reshape(-1, dim)
         ge = g[dim * nf:dim * (udp.get_nec() + nf)].reshape(-1, dim)
 
-        update = step_size * gf.sum(axis=0)
+        update = step_size * (gf * fitness_weights).sum(axis=0)
         update = update + (step_size * ge * e * lambda_constraint).sum(axis=0)
         x = x - update
 
