@@ -1,13 +1,21 @@
-from dataclasses import dataclass
-from typing import Tuple, Union
+from __future__ import annotations
 
-from curobo.geom.types import Mesh
-import numpy as np
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
 import torch
 from torch.autograd import Function
 from tqdm import tqdm
 
 from mcfly.utilities.sdf import BoundedSdf, CuroboMeshSdf, Sdf, SphereSdf
+
+
+def parallel_axis_theorem(i_com: torch.Tensor, m: torch.Tensor, d: torch.Tensor):
+    """Computes the inertia of a body with translated by d using the parallel axis theorem."""
+    eye = torch.eye(3).to(d).unsqueeze(0).repeat(d.shape[0], 1, 1)
+    return i_com + m.unsqueeze(-1) * (torch.norm(d, dim=1).unsqueeze(-1).unsqueeze(-1) ** 2 * eye
+                                      - torch.einsum('bi,bj->bij', d, d))
 
 @dataclass
 class Worker:
@@ -65,13 +73,15 @@ class Worker:
         """
         Computes the exterior score of the worker with respect to the shape.
         """
-        # TODO: Add meaningful weighting to the distance
-        # TODO: How do I want to get the gradients of the distance computation? Automatically? Implement a manual backprop?
         d, _ = QuerySdf.apply(self.query_shapes, shape)
-        debug, debug = shape(self.query_shapes, gradients=True)
-        weight =  1 / self.query_shapes[..., 3]
+        with torch.no_grad():
+            weight =  1 / self.radius.squeeze()
         return torch.sigmoid(-d * weight)
 
+    def get_worker_inertia(self, origin: torch.Tensor) -> torch.Tensor:
+        """Compute the approximated inertia that the workers add to a shape with reference coordinates at origin."""
+        d = self.center - origin
+        return parallel_axis_theorem(self.com_inertia, self.mass, d)
 
     def work_on_shape(self, shape: Sdf) -> Sdf:
         """Add the workers body to the shape if it is in the exterior."""
@@ -81,7 +91,7 @@ class Worker:
             return shape
         worker_sdf = SphereSdf(self.query_shapes.detach().clone()[mask])
         return shape.boolean_union(worker_sdf)
-    
+
 
 class QuerySdf(Function):
     """Query SDF with autograd support. Returns the distance and the gradient."""
@@ -105,61 +115,132 @@ class QuerySdf(Function):
             grad_query = grad_query.unsqueeze(-1) * ctx.saved_tensors[0]
         return grad_query, None
 
-def parallel_axis_theorem(i_com: torch.Tensor, m: torch.Tensor, d: torch.Tensor):
-    """Computes the inertia of a body with translated by d using the parallel axis theorem."""
-    eye = torch.eye(3).to(d).unsqueeze(0).repeat(d.shape[0], 1, 1)
-    return i_com + m.unsqueeze(-1) * (torch.norm(d, dim=1).unsqueeze(-1).unsqueeze(-1) ** 2 * eye
-                                      - torch.einsum('bi,bj->bij', d, d))
 
-def worker_inertia(worker: Worker, origin: torch.Tensor) -> torch.Tensor:
-    """Compute the approximated inertia that a worker adds to the shape."""
-    d = worker.center - origin
-    return parallel_axis_theorem(worker.com_inertia, worker.mass, d)
+class FleeingWorkerException(Exception):
+    """Exception raised when the workers are out of bounds."""
+    pass
 
-def remesh(shape: Sdf, center: torch.Tensor, dims: torch.Tensor) -> CuroboMeshSdf:
-    """Resamples the surface and returns the mesh for the new shape."""
-    v, f = shape.reconstruct_surface_poisson(center, dims, refinement_steps=7)
-    return CuroboMeshSdf.from_meshes([Mesh(name='o', vertices=v.astype(np.float32).tolist(),
-                                           faces=f.tolist(), pose=[0., 0., 0., 1., 0., 0., 0.])],
-                                     max_distance=dims.max().item())
+
+class AddRemoveAlgorithm(ABC):
+
+    def __init__(self,
+                 base_shape: BoundedSdf,
+                 max_workers: int,
+                 worker_radius: float,
+                 n_cycles: int,
+                 steps_per_cycle: int,
+                 bounds: Optional[torch.Tensor] = None,
+                 *,
+                 get_optimizer: Callable[[AddRemoveAlgorithm, List[torch.Tensor]], torch.optim.Optimizer] = None,
+                 worker_sampling: str = 'grid'
+                 ):
+        """
+        Args:
+            base_shape (BoundedSdf): The base shape to optimize.
+            max_workers (int): The maximum number of workers.
+            worker_radius (float): The radius of the workers.
+            n_cycles (int): The number of add/remove cycles to run.
+            steps_per_cycle (int): The number of steps per cycle.
+            bounds (Optional[torch.Tensor]): The bounds for the workers. Should be 2x3 with the min and max bounds.
+            get_optimizer (Callable[[List[torch.Tensor]], torch.optim.Optimizer]): A function that takes parameters
+                and returns an optimizer.
+            worker_sampling (str): The sampling strategy to use. Either 'grid' or 'random'.
+        """
+        self.base_shape = base_shape
+        self.bounds = bounds
+        self.center = self.base_shape.get_center()
+        self.shape = base_shape
+
+        random_sampling = worker_sampling == 'random'
+        self.workers = Worker(self.base_shape.sample_interior(max_points=max_workers, random=random_sampling),
+                              radius=worker_radius)
+
+        self.add_steps: int = steps_per_cycle
+        self.remove_steps: int = steps_per_cycle
+        self.n_cycles: int = n_cycles
+
+        if get_optimizer is None:
+            get_optimizer = self.default_optim
+        self.get_optimizer: Callable[[AddRemoveAlgorithm, List[torch.Tensor]], torch.optim.Optimizer] = get_optimizer
+
+    @abstractmethod
+    def loss(self) -> torch.Tensor:
+        """Compute the loss for the optimization."""
+        pass
+
+    def add_material(self):
+        """Moves the workers to the exterior to expand the current shape."""
+        optim = self.get_optimizer(self, [self.workers.center, self.workers.radius])
+
+        for step in tqdm(range(self.add_steps), desc="Adding material"):
+            optim.zero_grad()
+            loss = self.loss()
+            loss.backward()
+            optim.step()
+            self.shape = self.workers.work_on_shape(self.shape)
+            try:
+                self.check_bounds()
+            except FleeingWorkerException:
+                break
+
+    @staticmethod
+    def default_optim(algo, params: List[torch.Tensor]) -> torch.optim.Optimizer:
+        """Default optimizer for the workers."""
+        return torch.optim.SGD([
+            {'params': params[0], 'lr': 1e-3, 'name': 'center'},
+            {'params': params[1], 'lr': 1e-4, 'name': 'radius'}
+        ])
+
+    def remove_material(self):
+        pass
+
+    def check_bounds(self):
+        """Makes sure the workers are not working outside their bounds."""
+        if self.bounds is None:
+            return
+        aabb = self.workers.aabb
+        if (aabb[0].min() < self.bounds[0].min()).any() or (aabb[1].max() > self.bounds[1].max()).any():
+            raise FleeingWorkerException("Workers are out of bounds.")
+
+    def optimize(self):
+        """Optimize the workers to add material to the shape."""
+        for cycle in range(self.n_cycles):
+            print(f"Cycle {cycle + 1}/{self.n_cycles}")
+            self.add_material()
+            self.remove_material()
+
+    def visualize(self):
+        """Visualize the current shape."""
+        worker_dims = self.workers.aabb[1] - self.workers.aabb[0]
+        dims = torch.maximum(self.base_shape.get_dims(), worker_dims)
+        self.shape.pv_plot(self.center, dims, pts_per_dim=80)
+
+
+class XxRollingBehavior(AddRemoveAlgorithm):
+
+    def loss(self):
+        inertia = self.workers.get_worker_inertia(self.center)
+        scores = self.workers.get_exterior_score(self.shape)
+        workers_reward = (3 * inertia[:, 0, 0] - inertia[:, 1, 1] - inertia[:, 2, 2]) * scores
+        reward = workers_reward.sum() * 1e3
+        return -reward
+
 
 def main():
     radius = 0.5
     shape_gt: BoundedSdf = SphereSdf(torch.tensor([[0., 0., 0., radius]]))
-    origin = shape_gt.get_center()
     # shape = remesh(shape_gt, origin, shape_gt.get_dims())
     shape = shape_gt
 
     max_workers = 50
     n_cycles: int = 1
-    steps_per_iteration: int = 5000
-
-    for cycle in range(n_cycles):
-        workers = Worker(shape.sample_interior(max_points=max_workers), radius=.1)
-        optim = torch.optim.SGD([workers.center], lr=1e-3, maximize=True)
-
-        for step in tqdm(range(steps_per_iteration)):
-            optim.zero_grad()
-            inertia = worker_inertia(workers, origin)
-            scores = workers.get_exterior_score(shape)
-            workers_reward = (3 * inertia[:, 0, 0] - inertia[:, 1, 1] - inertia[:, 2, 2]) * scores
-            reward = workers_reward.sum() * 1e3
-            reward.backward()
-
-            torch.nn.utils.clip_grad_norm_(workers.center, 5.0)
-            optim.step()
-            shape = workers.work_on_shape(shape)
-
-
-            if workers.center.max() > 0.8:
-                print("Worker out of bounds, stopping optimization.")
-                break
-
-        worker_dims = workers.aabb[1] - workers.aabb[0]
-        dims = torch.maximum(shape_gt.get_dims(), worker_dims)
-        shape.pv_plot(shape_gt.get_center(), dims, pts_per_dim=100)
-        print(workers.center)
-        # shape = remesh(shape, origin, dims)
+    steps_per_iteration: int = 1000
+    bounds = torch.tensor([[-1., -1., -1.], [1., 1., 1.]])
+    algo = XxRollingBehavior(shape, max_workers, 0.1, n_cycles, steps_per_iteration, bounds=bounds)
+    print(algo.workers.aabb)
+    algo.optimize()
+    print(algo.workers.aabb)
+    algo.visualize()
 
 
 if __name__ == "__main__":

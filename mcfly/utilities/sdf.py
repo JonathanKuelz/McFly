@@ -330,6 +330,21 @@ class Sdf(ABC):
             v, f = pymeshfix.clean_from_arrays(v, f)
         return v, f
 
+    def remesh(self,
+               center: torch.Tensor,
+               dims: torch.Tensor,
+               refinement_steps: int = 6,
+               ) -> CuroboMeshSdf:
+        """Resamples the surface and returns the mesh for the new shape."""
+        v, f = self.reconstruct_surface_poisson(center, dims, refinement_steps=refinement_steps)
+        return CuroboMeshSdf.from_meshes(
+            [Mesh(
+                name='remeshed', vertices=v.astype(np.float32).tolist(),
+                faces=f.tolist(), pose=[0., 0., 0., 1., 0., 0., 0.]
+                )],
+            max_distance=dims.max().item()
+            )
+
     def sample(self,
                center: torch.Tensor,
                dims: Iterable[float],
