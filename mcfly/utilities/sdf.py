@@ -430,11 +430,34 @@ class BoundedSdf(Sdf, ABC):
     def reconstruct_surface_poisson(self,
                                     center: Optional[torch.Tensor] = None,
                                     dims: Optional[Iterable[float]] = None,
-                                    refinement_steps: int = 6
-                                    ) -> o3d.geometry.TriangleMesh:
+                                    refinement_steps: int = 6,
+                                    fix_mesh: bool = True
+                                    ) -> Tuple[np.ndarray, np.ndarray]:
         center = self.get_center() if center is None else center
         dims = self.get_dims() if dims is None else dims
-        return super().reconstruct_surface_poisson(center, dims, refinement_steps)
+        return super().reconstruct_surface_poisson(center, dims, refinement_steps, fix_mesh)
+
+    def sample_interior(self,
+                        max_points: int,
+                        random: bool = False,
+                        threshold: float = 0.0) -> torch.Tensor:
+        """
+        Sample points from the interior of this SDF using rejection sampling.
+
+        Args:
+            max_points: The maximum number of points to return.
+            random: If True, randomly sample points, if false, sample points in a grid.
+            threshold: Minimum distance to the surface to be considered inside.
+        """
+        pts_per_dim = int(np.ceil(max_points ** (1 / 3)))
+        if random:
+            pts = torch.rand((max_points, 3), device=self.get_center().device)
+            grid = self.get_center() - self.get_dims() / 2 + pts * self.get_dims()
+            d = self(grid)
+        else:
+            grid, d = self.sample(self.get_center(), self.get_dims(), pts_per_dim, r=threshold)
+        mask = d >= threshold
+        return torch.stack(grid, dim=-1)[mask][:max_points]
 
 class CuroboMeshSdf(BoundedSdf):
     """A signed distance function representing a curobo mesh."""
@@ -446,14 +469,16 @@ class CuroboMeshSdf(BoundedSdf):
         self._is_accurate = False
 
     def _callable(self, pts: torch.Tensor, gradients: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if gradients:
+        if gradients and not pts.requires_grad:
             pts.requires_grad = True
         if pts.shape[-1] == 3:
             pts = torch.concatenate([pts, torch.zeros((*pts.shape[:-1], 1), device=pts.device)], dim=-1)
         query_spheres = {'query_spheres': pts.view(1, 1, -1, 4)}
         sdf_info = get_sdf(query_spheres, self.wcm)
         if gradients:
-            return sdf_info['query_spheres'].distances, sdf_info['query_spheres'].grad
+            grads = sdf_info['query_spheres'].grad
+            grads[..., 3] = 1.  # dd/dr is 1, but CuRobo does not provide this
+            return sdf_info['query_spheres'].distances, grads
         return sdf_info['query_spheres'].distances
 
     @classmethod
@@ -571,11 +596,15 @@ class SphereSdf(BoundedSdf):
         else:
             r = torch.zeros(pts.shape[:-1], device=pts.device)
         deltas = pts[..., None, :] - self.sph[..., :3]
-        d, idx = torch.min(torch.linalg.norm(deltas, dim=-1), dim=-1)
-        d = d - self.sph[idx, 3] - r
+        delta_norm = torch.linalg.norm(deltas, dim=-1)
+        d = delta_norm - self.sph[..., 3]
+        d, idx = torch.min(d, dim=-1)
+        d = d - r
         if gradients:
-            grads = torch.concat([-deltas[torch.arange(deltas.shape[0]), idx],
-                                  torch.zeros((deltas.shape[0], 1)).to(deltas)], dim=-1)
+            g = torch.zeros_like(deltas)
+            compute = delta_norm > 0
+            g[compute] = deltas[compute] / delta_norm.unsqueeze(-1)[compute]
+            grads = torch.concat([-g[torch.arange(g.shape[0]), idx], torch.ones((g.shape[0], 1)).to(g)], dim=-1)
             return -d, grads
         return -d
 
