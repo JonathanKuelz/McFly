@@ -452,28 +452,6 @@ class BoundedSdf(Sdf, ABC):
         dims = self.get_dims() if dims is None else dims
         return super().reconstruct_surface_poisson(center, dims, refinement_steps, fix_mesh)
 
-    def sample_interior(self,
-                        max_points: int,
-                        random: bool = False,
-                        threshold: float = 0.0) -> torch.Tensor:
-        """
-        Sample points from the interior of this SDF using rejection sampling.
-
-        Args:
-            max_points: The maximum number of points to return.
-            random: If True, randomly sample points, if false, sample points in a grid.
-            threshold: Minimum distance to the surface to be considered inside.
-        """
-        pts_per_dim = int(np.ceil(max_points ** (1 / 3)))
-        if random:
-            pts = torch.rand((max_points, 3), device=self.get_center().device)
-            grid = self.get_center() - self.get_dims() / 2 + pts * self.get_dims()
-            d = self(grid)
-        else:
-            grid, d = self.sample(self.get_center(), self.get_dims(), pts_per_dim, r=threshold)
-        mask = d >= threshold
-        return torch.stack(grid, dim=-1)[mask][:max_points]
-
 class CuroboMeshSdf(BoundedSdf):
     """A signed distance function representing a curobo mesh."""
 

@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch.autograd import Function
 from tqdm import tqdm
@@ -23,6 +24,8 @@ class Worker:
     center: torch.Tensor
     radius: Union[torch.Tensor, float]
     density: float = 1.
+    add_material: bool = False
+    carve_material: bool = False
 
     def __post_init__(self):
         self.center.requires_grad = True
@@ -63,20 +66,37 @@ class Worker:
     @property
     def volume(self) -> torch.Tensor:
         """Compute the volume of the worker."""
-        return (4. / 3.) * torch.pi * self.radius ** 3
+        vol = (4. / 3.) * torch.pi * self.radius ** 3
+        if self.add_material:
+            return vol
+        else:
+            return -vol
 
     @property
     def sdf(self):
         return SphereSdf(self.query_shapes.detach().clone())
 
-    def get_exterior_score(self, shape: Sdf) -> torch.Tensor:
+    def enable_addition(self):
+        """Enable addition of material."""
+        self.add_material = True
+        self.carve_material = False
+
+    def enable_carving(self):
+        """Enable carving of material."""
+        self.add_material = False
+        self.carve_material = True
+
+    def get_relevance_score(self, shape: Sdf) -> torch.Tensor:
         """
-        Computes the exterior score of the worker with respect to the shape.
+        Computes a score indicating how much the worker is changing the material.
         """
         d, _ = QuerySdf.apply(self.query_shapes, shape)
         with torch.no_grad():
             weight =  1 / self.radius.squeeze()
-        return torch.sigmoid(-d * weight)
+        if self.add_material:
+            return torch.sigmoid(-d * weight)  # Higher scores fore being outside
+        else:
+            return torch.sigmoid(d * weight)  # Higher scores fore being inside
 
     def get_worker_inertia(self, origin: torch.Tensor) -> torch.Tensor:
         """Compute the approximated inertia that the workers add to a shape with reference coordinates at origin."""
@@ -85,12 +105,28 @@ class Worker:
 
     def work_on_shape(self, shape: Sdf) -> Sdf:
         """Add the workers body to the shape if it is in the exterior."""
-        # TODO: Or remove it when it is in the interior
+        if self.add_material:
+            return self._add_material(shape)
+        elif self.carve_material:
+            return self._carve_material(shape)
+        else:
+            raise ValueError("Workers are not enabled for addition or carving.")
+
+    def _add_material(self, shape: Sdf):
+        """Add the workers body to the shape if it is in the exterior."""
         mask = shape(self.query_shapes) < self.radius.squeeze()
         if mask.sum() == 0:
             return shape
         worker_sdf = SphereSdf(self.query_shapes.detach().clone()[mask])
         return shape.boolean_union(worker_sdf)
+
+    def _carve_material(self, shape: Sdf):
+        """Remove the workers body from the shape if it is in the exterior."""
+        mask = shape(self.query_shapes) > 0
+        if mask.sum() == 0:
+            return shape
+        worker_sdf = SphereSdf(self.query_shapes.detach().clone()[mask])
+        return shape.boolean_difference(worker_sdf)
 
 
 class QuerySdf(Function):
@@ -123,6 +159,8 @@ class FleeingWorkerException(Exception):
 
 class AddRemoveAlgorithm(ABC):
 
+    oversample: int = 10
+
     def __init__(self,
                  base_shape: BoundedSdf,
                  max_workers: int,
@@ -151,9 +189,10 @@ class AddRemoveAlgorithm(ABC):
         self.center = self.base_shape.get_center()
         self.shape = base_shape
 
-        random_sampling = worker_sampling == 'random'
-        self.workers = Worker(self.base_shape.sample_interior(max_points=max_workers, random=random_sampling),
-                              radius=worker_radius)
+        self.random_sampling = worker_sampling == 'random'
+        self.max_workers = max_workers
+        self.worker_radius = worker_radius
+        self.workers = None
 
         self.add_steps: int = steps_per_cycle
         self.remove_steps: int = steps_per_cycle
@@ -168,21 +207,6 @@ class AddRemoveAlgorithm(ABC):
         """Compute the loss for the optimization."""
         pass
 
-    def add_material(self):
-        """Moves the workers to the exterior to expand the current shape."""
-        optim = self.get_optimizer(self, [self.workers.center, self.workers.radius])
-
-        for step in tqdm(range(self.add_steps), desc="Adding material"):
-            optim.zero_grad()
-            loss = self.loss()
-            loss.backward()
-            optim.step()
-            self.shape = self.workers.work_on_shape(self.shape)
-            try:
-                self.check_bounds()
-            except FleeingWorkerException:
-                break
-
     @staticmethod
     def default_optim(algo, params: List[torch.Tensor]) -> torch.optim.Optimizer:
         """Default optimizer for the workers."""
@@ -191,16 +215,65 @@ class AddRemoveAlgorithm(ABC):
             {'params': params[1], 'lr': 1e-4, 'name': 'radius'}
         ])
 
-    def remove_material(self):
-        pass
-
     def check_bounds(self):
         """Makes sure the workers are not working outside their bounds."""
-        if self.bounds is None:
+        if self.bounds is None or self.workers.carve_material:
             return
         aabb = self.workers.aabb
         if (aabb[0].min() < self.bounds[0].min()).any() or (aabb[1].max() > self.bounds[1].max()).any():
             raise FleeingWorkerException("Workers are out of bounds.")
+
+    def optimization_cycle(self):
+        """Moves the workers to the exterior to expand the current shape."""
+        optim = self.get_optimizer(self, [self.workers.center, self.workers.radius])
+
+        for step in tqdm(range(self.add_steps), desc="Adding material"):
+            optim.zero_grad()
+            loss = self.loss()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([self.workers.center, self.workers.radius], self.max_workers)
+            optim.step()
+            self.shape = self.workers.work_on_shape(self.shape)
+            try:
+                self.check_bounds()
+            except FleeingWorkerException:
+                break
+
+    def add_material(self):
+        """Add material to the shape."""
+        self.workers = Worker(self.sample(interior=True), radius=self.worker_radius)
+        self.workers.enable_addition()
+        self.optimization_cycle()
+
+    def remove_material(self):
+        """Add material to the shape."""
+        self.workers = Worker(self.sample(interior=False), radius=self.worker_radius)
+        self.workers.enable_carving()
+        self.optimization_cycle()
+
+    def sample(self, interior: bool = True) -> torch.Tensor:
+        """Sample points to spawn the workers."""
+        dim = self.bounds[1] - self.bounds[0]
+        num_sample = self.max_workers * self.oversample
+        if self.random_sampling:
+            pts = torch.rand((num_sample, 3))
+            grid = self.center + dim * (pts - .5)
+            d = self.shape(grid)
+        else:
+            pts_per_dim = int(np.ceil(num_sample ** (1 / 3)))
+            grid, d = self.shape.sample(self.center, dim, pts_per_dim)
+        if interior:
+            mask = d >= 0
+        else:
+            mask = d <= 0
+        if not mask.any():
+            raise ValueError("No valid points found for the workers.")
+        valid_samples = torch.stack(grid, dim=-1)[mask]
+        if valid_samples.shape[0] <= self.max_workers:
+            return valid_samples
+        else:
+            choice = torch.randperm(valid_samples.shape[0])[:self.max_workers]
+            return valid_samples[choice]
 
     def optimize(self):
         """Optimize the workers to add material to the shape."""
@@ -208,19 +281,21 @@ class AddRemoveAlgorithm(ABC):
             print(f"Cycle {cycle + 1}/{self.n_cycles}")
             self.add_material()
             self.remove_material()
+            if cycle < self.n_cycles - 1:
+                pass
+                # self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7)
 
     def visualize(self):
         """Visualize the current shape."""
-        worker_dims = self.workers.aabb[1] - self.workers.aabb[0]
-        dims = torch.maximum(self.base_shape.get_dims(), worker_dims)
-        self.shape.pv_plot(self.center, dims, pts_per_dim=80)
+        dims = self.bounds[1] - self.bounds[0]
+        self.shape.pv_plot(self.center, dims, pts_per_dim=120)
 
 
 class XxRollingBehavior(AddRemoveAlgorithm):
 
     def loss(self):
         inertia = self.workers.get_worker_inertia(self.center)
-        scores = self.workers.get_exterior_score(self.shape)
+        scores = self.workers.get_relevance_score(self.shape)
         workers_reward = (3 * inertia[:, 0, 0] - inertia[:, 1, 1] - inertia[:, 2, 2]) * scores
         reward = workers_reward.sum() * 1e3
         return -reward
@@ -232,15 +307,17 @@ def main():
     # shape = remesh(shape_gt, origin, shape_gt.get_dims())
     shape = shape_gt
 
-    max_workers = 50
-    n_cycles: int = 1
-    steps_per_iteration: int = 1000
+    max_workers = 1000
+    n_cycles: int = 10
+    steps_per_iteration: int = 120
     bounds = torch.tensor([[-1., -1., -1.], [1., 1., 1.]])
-    algo = XxRollingBehavior(shape, max_workers, 0.1, n_cycles, steps_per_iteration, bounds=bounds)
-    print(algo.workers.aabb)
+    algo = XxRollingBehavior(shape, max_workers, 0.03, n_cycles, steps_per_iteration, bounds=bounds)
     algo.optimize()
-    print(algo.workers.aabb)
     algo.visualize()
+    print(algo.workers.aabb)
+    # TODO: Spawn them on the surface, not in the interior. Also, can I somehow "close" the shape again?
+    # TODO: See how it works if theres really A LOT of them
+    # TODO: Stop the workers before they reach the bounds, leave the others running
 
 
 if __name__ == "__main__":
