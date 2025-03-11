@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable,  List, Optional, Tuple, Union
 
+from faker import Faker
 import numpy as np
+import pyvista as pv
 import torch
 from torch.autograd import Function
 from tqdm import tqdm
 
-from mcfly.utilities.sdf import BoundedSdf, CuroboMeshSdf, Sdf, SphereSdf
+from mcfly.utilities.file_locations import PLOTS
+from mcfly.utilities.sdf import BoundedSdf, Sdf, SphereSdf
 
 
 def parallel_axis_theorem(i_com: torch.Tensor, m: torch.Tensor, d: torch.Tensor):
@@ -18,20 +21,26 @@ def parallel_axis_theorem(i_com: torch.Tensor, m: torch.Tensor, d: torch.Tensor)
     return i_com + m.unsqueeze(-1) * (torch.norm(d, dim=1).unsqueeze(-1).unsqueeze(-1) ** 2 * eye
                                       - torch.einsum('bi,bj->bij', d, d))
 
-@dataclass
 class Worker:
 
-    center: torch.Tensor
-    radius: Union[torch.Tensor, float]
-    density: float = 1.
-    add_material: bool = False
-    carve_material: bool = False
-
-    def __post_init__(self):
-        self.center.requires_grad = True
-        if isinstance(self.radius, float):
-            self.radius: torch.Tensor = torch.ones((self.center.shape[0], 1)).to(self.center) * self.radius
-        self.radius.requires_grad = True
+    def __init__(self,
+                 center: torch.Tensor,
+                 radius: Union[torch.Tensor, float],
+                 density: float = 1.,
+                 *,
+                 min_radius: float = 0.01,
+                 ):
+        self.center: torch.Tensor = center.detach().requires_grad_(True)
+        if isinstance(radius, float):
+            radius: torch.Tensor = torch.ones((self.center.shape[0], 1)).to(self.center) * radius
+        if not (radius >= min_radius).all():
+            raise ValueError('radius must be >= min_radius')
+        self._radius: torch.Tensor = radius.requires_grad_(True)
+        self._min_radius: torch.Tensor = torch.ones_like(radius).requires_grad_(False) * min_radius
+        self.density: float = density
+        self.active = torch.ones(self.center.shape[0], dtype=torch.bool).to(self.center.device)
+        self.add_material: bool = False
+        self.carve_material: bool = False
 
     @property
     def aabb(self) -> torch.Tensor:
@@ -41,8 +50,11 @@ class Worker:
     @property
     def com_inertia(self) -> torch.Tensor:
         """Compute the inertia of the worker with respect to their own center of mass."""
-        inertia = torch.zeros((self.num_workers, 3, 3)).to(self.center)
-        i = (2 / 5) * self.mass * self.radius ** 2
+        inertia = torch.zeros((self.active.sum(), 3, 3)).to(self.center)
+        # i = (2 / 5) * self.mass * self.radius[self.active] ** 2
+        i = (2 / 5)  * (4. / 3.) * self.radius[self.active] ** 5 * self.density * torch.pi
+        if self.carve_material:
+            i = -i
         inertia[:, 0, 0] = i.squeeze()
         inertia[:, 1, 1] = i.squeeze()
         inertia[:, 2, 2] = i.squeeze()
@@ -59,14 +71,24 @@ class Worker:
         return self.center.shape[0]
 
     @property
+    def optimization_parameters(self) -> List[torch.Tensor]:
+        """Returns the leaf parameters to optimize."""
+        return [self.center, self._radius]
+
+    @property
     def query_shapes(self) -> torch.Tensor:
         """Returns geometric primitives describing the workers."""
-        return torch.concat((self.center, self.radius), dim=1)
+        return torch.concat((self.center[self.active], self.radius[self.active]), dim=1)
+
+    @property
+    def radius(self) -> torch.Tensor:
+        """Makes sure the radius of the workers is always larger than the defined minimum."""
+        return torch.maximum(self._radius, self._min_radius)
 
     @property
     def volume(self) -> torch.Tensor:
         """Compute the volume of the worker."""
-        vol = (4. / 3.) * torch.pi * self.radius ** 3
+        vol = (4. / 3.) * torch.pi * self.radius[self.active] ** 3
         if self.add_material:
             return vol
         else:
@@ -89,18 +111,25 @@ class Worker:
     def get_relevance_score(self, shape: Sdf) -> torch.Tensor:
         """
         Computes a score indicating how much the worker is changing the material.
+
+        Args:
+            shape (Sdf): The shape that the signed distance should be computed for. This should typicalle NOT be the
+                shape that is changed in every iteration, because this would lead to unstable gradients.
         """
-        d, _ = QuerySdf.apply(self.query_shapes, shape)
+        d, _g = QuerySdf.apply(self.query_shapes, shape, shape, True)
         with torch.no_grad():
-            weight =  1 / self.radius.squeeze()
+            weight =  1 / self.radius[self.active].squeeze()
         if self.add_material:
-            return torch.sigmoid(-d * weight)  # Higher scores fore being outside
+            return torch.sigmoid(-d * weight) / torch.sigmoid(torch.tensor([-1])) # Higher scores fore being outside
         else:
-            return torch.sigmoid(d * weight)  # Higher scores fore being inside
+            if d.abs().mean() < 0.0001:
+                print()
+            shape(self.query_shapes)
+            return torch.sigmoid(d * weight) / torch.sigmoid(torch.tensor([1])) # Higher scores fore being inside
 
     def get_worker_inertia(self, origin: torch.Tensor) -> torch.Tensor:
         """Compute the approximated inertia that the workers add to a shape with reference coordinates at origin."""
-        d = self.center - origin
+        d = self.center[self.active] - origin
         return parallel_axis_theorem(self.com_inertia, self.mass, d)
 
     def work_on_shape(self, shape: Sdf) -> Sdf:
@@ -113,15 +142,25 @@ class Worker:
             raise ValueError("Workers are not enabled for addition or carving.")
 
     def _add_material(self, shape: Sdf):
-        """Add the workers body to the shape if it is in the exterior."""
-        mask = shape(self.query_shapes) < self.radius.squeeze()
+        """
+        Add the workers body to the shape if it is in the exterior.
+
+        Args:
+            shape (Sdf): The shape to add the workers body to.
+        """
+        mask = shape(self.query_shapes) < self.radius[self.active].squeeze()
         if mask.sum() == 0:
             return shape
         worker_sdf = SphereSdf(self.query_shapes.detach().clone()[mask])
         return shape.boolean_union(worker_sdf)
 
     def _carve_material(self, shape: Sdf):
-        """Remove the workers body from the shape if it is in the exterior."""
+        """
+        Remove the workers body from the shape if it is in the exterior.
+
+        Args:
+            shape (Sdf): The shape to remove the workers body
+        """
         mask = shape(self.query_shapes) > 0
         if mask.sum() == 0:
             return shape
@@ -133,23 +172,34 @@ class QuerySdf(Function):
     """Query SDF with autograd support. Returns the distance and the gradient."""
 
     @staticmethod
-    def forward(query_shapes: torch.Tensor, shape: BoundedSdf) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(query_shapes: torch.Tensor,
+                shape: BoundedSdf,
+                gradient_shape: BoundedSdf,
+                guess_missing_gradients: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute the gradient in the forward pass because not all SDFs support autograd."""
-        d, g = shape(query_shapes, gradients=True)
+        d, _ = shape(query_shapes, gradients=True)
+        _, g = gradient_shape(query_shapes, gradients=True)
         return d, g
 
     @staticmethod
     def setup_context(ctx, inputs, output):
         """Save the gradient for later"""
+        query, _, _, guess_gradients = inputs
         d, g = output
-        ctx.save_for_backward(g)
+        ctx.save_for_backward(g, torch.tensor([guess_gradients]), query)
 
     @staticmethod
     def backward(ctx, grad_query, grad_shape):
         """Compute the backward gradient using a simple chain rule."""
+        grad, guess_grad, query = ctx.saved_tensors
         if grad_query is not None:
-            grad_query = grad_query.unsqueeze(-1) * ctx.saved_tensors[0]
-        return grad_query, None
+            grad_query = grad_query.unsqueeze(-1) * grad
+
+            if guess_grad.item():
+                mask = torch.norm(grad[:, :3], dim=1) == 0.
+                if mask.any():
+                    grad_query[mask, :3] = (- query[:, :3] / query[:, :3].norm(dim=1).unsqueeze(-1))[mask]
+        return grad_query, None, None, None
 
 
 class FleeingWorkerException(Exception):
@@ -158,8 +208,6 @@ class FleeingWorkerException(Exception):
 
 
 class AddRemoveAlgorithm(ABC):
-
-    oversample: int = 10
 
     def __init__(self,
                  base_shape: BoundedSdf,
@@ -192,6 +240,7 @@ class AddRemoveAlgorithm(ABC):
         self.random_sampling = worker_sampling == 'random'
         self.max_workers = max_workers
         self.worker_radius = worker_radius
+        self.active_workers = None
         self.workers = None
 
         self.add_steps: int = steps_per_cycle
@@ -201,6 +250,7 @@ class AddRemoveAlgorithm(ABC):
         if get_optimizer is None:
             get_optimizer = self.default_optim
         self.get_optimizer: Callable[[AddRemoveAlgorithm, List[torch.Tensor]], torch.optim.Optimizer] = get_optimizer
+        self.name = Faker().first_name()
 
     @abstractmethod
     def loss(self) -> torch.Tensor:
@@ -211,91 +261,153 @@ class AddRemoveAlgorithm(ABC):
     def default_optim(algo, params: List[torch.Tensor]) -> torch.optim.Optimizer:
         """Default optimizer for the workers."""
         return torch.optim.SGD([
-            {'params': params[0], 'lr': 1e-3, 'name': 'center'},
+            {'params': params[0], 'lr': 1e-2, 'name': 'center'},
             {'params': params[1], 'lr': 1e-4, 'name': 'radius'}
         ])
-
-    def check_bounds(self):
-        """Makes sure the workers are not working outside their bounds."""
-        if self.bounds is None or self.workers.carve_material:
-            return
-        aabb = self.workers.aabb
-        if (aabb[0].min() < self.bounds[0].min()).any() or (aabb[1].max() > self.bounds[1].max()).any():
-            raise FleeingWorkerException("Workers are out of bounds.")
-
-    def optimization_cycle(self):
-        """Moves the workers to the exterior to expand the current shape."""
-        optim = self.get_optimizer(self, [self.workers.center, self.workers.radius])
-
-        for step in tqdm(range(self.add_steps), desc="Adding material"):
-            optim.zero_grad()
-            loss = self.loss()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_([self.workers.center, self.workers.radius], self.max_workers)
-            optim.step()
-            self.shape = self.workers.work_on_shape(self.shape)
-            try:
-                self.check_bounds()
-            except FleeingWorkerException:
-                break
-
-    def add_material(self):
-        """Add material to the shape."""
-        self.workers = Worker(self.sample(interior=True), radius=self.worker_radius)
-        self.workers.enable_addition()
-        self.optimization_cycle()
-
-    def remove_material(self):
-        """Add material to the shape."""
-        self.workers = Worker(self.sample(interior=False), radius=self.worker_radius)
-        self.workers.enable_carving()
-        self.optimization_cycle()
-
-    def sample(self, interior: bool = True) -> torch.Tensor:
-        """Sample points to spawn the workers."""
-        dim = self.bounds[1] - self.bounds[0]
-        num_sample = self.max_workers * self.oversample
-        if self.random_sampling:
-            pts = torch.rand((num_sample, 3))
-            grid = self.center + dim * (pts - .5)
-            d = self.shape(grid)
-        else:
-            pts_per_dim = int(np.ceil(num_sample ** (1 / 3)))
-            grid, d = self.shape.sample(self.center, dim, pts_per_dim)
-        if interior:
-            mask = d >= 0
-        else:
-            mask = d <= 0
-        if not mask.any():
-            raise ValueError("No valid points found for the workers.")
-        valid_samples = torch.stack(grid, dim=-1)[mask]
-        if valid_samples.shape[0] <= self.max_workers:
-            return valid_samples
-        else:
-            choice = torch.randperm(valid_samples.shape[0])[:self.max_workers]
-            return valid_samples[choice]
 
     def optimize(self):
         """Optimize the workers to add material to the shape."""
         for cycle in range(self.n_cycles):
             print(f"Cycle {cycle + 1}/{self.n_cycles}")
-            self.add_material()
-            self.remove_material()
-            if cycle < self.n_cycles - 1:
-                pass
-                # self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7)
+            # self._add_material()
+            # self.visualize_with_workers()
+            # self.shape.plot_reconstructed_surface(self.center, self.bounds[1] - self.bounds[0])
+            #
+            # self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7, limit_to='exterior')
+
+            self._remove_material()
+            self.visualize_with_workers()
+            self.shape.plot_reconstructed_surface(self.center, self.bounds[1] - self.bounds[0], refinement_steps=7)
+            self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7, limit_to='interior')
+
+    def optimization_cycle(self):
+        """Moves the workers to the exterior to expand the current shape."""
+        optim = self.get_optimizer(self, self.workers.optimization_parameters)
+        for step in tqdm(range(self.add_steps), desc=f"{'Adding' if self.workers.add_material else 'Removing'} material"):
+            optim.zero_grad()
+            loss = self.loss()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.workers.optimization_parameters, 1.)
+            optim.step()
+            self.shape = self.workers.work_on_shape(self.shape)
+            self._set_worker_active()
 
     def visualize(self):
         """Visualize the current shape."""
         dims = self.bounds[1] - self.bounds[0]
-        self.shape.pv_plot(self.center, dims, pts_per_dim=120)
+        self.shape.pv_plot(self.center, dims * 1.1, pts_per_dim=120)
+
+    def visualize_with_workers(self):
+        """Visualize the current shape with the workers."""
+        dims = (self.bounds[1] - self.bounds[0]).detach().cpu().numpy()
+        pt_radius = np.mean(dims) / 120
+        grid, d = self.shape.sample(self.center, dims, 120, r=pt_radius)
+        grid, d_worker = self.workers.sdf.sample(self.center, dims, 120, r=pt_radius)
+
+        d = d.detach().cpu().numpy()
+        d_worker = d_worker.detach().cpu().numpy()
+        mask = d > 0.0
+        mask_worker = d_worker > 0.0
+
+        pts_shape = np.stack([g.detach().cpu().numpy()[mask] for g in grid], axis=-1)
+        pts_worker = np.stack([g.detach().cpu().numpy()[mask_worker] for g in grid], axis=-1)
+        d = d[mask]
+
+        scale = np.mean(dims)
+
+        plotter = pv.Plotter()
+        plotter.add_axes()
+        plotter.add_points(
+            pts_shape,
+            scalars=d,
+            style='points_gaussian',
+            render_points_as_spheres=True,
+            point_size=10 / scale,
+            show_scalar_bar=False,
+            )
+        plotter.add_points(
+            pts_worker,
+            color='red',
+            style='points_gaussian',
+            render_points_as_spheres=True,
+            point_size=10 / scale,
+        )
+        plotter.show()
+
+    def save_screenshot(self, postfix: str = ''):
+        """Save a screenshot of the current shape."""
+        dims = self.bounds[1] - self.bounds[0]
+        self.shape.pv_plot(self.center, dims * 1.1, pts_per_dim=120, show=False,
+                           save_at=PLOTS / 'addremove' / f'{self.name}{postfix}.eps')
+
+    def _add_material(self):
+        """Add material to the shape."""
+        self.workers = Worker(self._sample(interior=True), radius=self.worker_radius)
+        self.workers.enable_addition()
+        self._set_worker_active()
+        self.optimization_cycle()
+
+    def _remove_material(self):
+        """Add material to the shape."""
+        self.workers = Worker(self._sample(interior=False), radius=self.worker_radius)
+        self.workers.enable_carving()
+        self._set_worker_active()
+        self.optimization_cycle()
+
+    def _check_bounds(self):
+        """Makes sure the workers are not working outside their bounds."""
+        if self.bounds is None or self.workers.carve_material:
+            return
+
+        if not self._get_workers_in_bounds(add_phase_threshold=1.)[self.workers.active].all():
+            raise FleeingWorkerException("Workers are out of bounds.")
+
+    def _get_workers_in_bounds(self, add_phase_threshold: float = 0.95):
+        """Checks which of the current workers are within the bounds."""
+        outer_positions = self.workers.center
+        bounds = self.bounds
+        if self.workers.add_material:  # Worker body contributes towards shape
+            outer_positions = outer_positions + torch.sign(self.workers.center) * self.workers.radius
+            bounds = bounds * add_phase_threshold
+        return torch.logical_and((outer_positions > bounds[0]).all(dim=1), (outer_positions < bounds[1]).all(dim=1))
+
+    def _set_worker_active(self, add_phase_threshold: float = 0.95):
+        """Set the active workers to be within the bounds."""
+        self.workers.active = self._get_workers_in_bounds(add_phase_threshold=add_phase_threshold)
+
+    def _sample(self, interior: bool = True) -> torch.Tensor:
+        """Sample points to spawn the workers."""
+        dim = self.bounds[1] - self.bounds[0]
+        surf, normals = self.shape.get_surface_points(self.center, dim, 9)
+        d = self.shape(surf)
+        if self.random_sampling:
+            on_surface = torch.abs(d) < 1e-6
+            if on_surface.sum() > self.max_workers:
+                candidates = torch.arange(surf.shape[0])[on_surface]
+                selection = candidates[torch.randperm(candidates.shape[0])][:self.max_workers]
+            else:
+                selection = torch.argsort(torch.abs(d))[:self.max_workers]
+        else:
+            # Try to select evenly along the grid
+            every_nth = surf.shape[0] // self.max_workers
+            selection = torch.arange(surf.shape[0])[::every_nth][:self.max_workers]
+
+        # Move the workers just to the inside/outside of the shape
+        safety_factor = 1.1
+        surface = surf[selection]
+        if interior:
+            workers = surface + (self.worker_radius - d[selection]).unsqueeze(-1) * safety_factor * normals[selection]
+        else:
+            workers = surface - (self.worker_radius - d[selection]).unsqueeze(-1) * safety_factor * normals[selection]
+        return workers
+
 
 
 class XxRollingBehavior(AddRemoveAlgorithm):
 
     def loss(self):
         inertia = self.workers.get_worker_inertia(self.center)
-        scores = self.workers.get_relevance_score(self.shape)
+        scores = self.workers.get_relevance_score(self.base_shape)
         workers_reward = (3 * inertia[:, 0, 0] - inertia[:, 1, 1] - inertia[:, 2, 2]) * scores
         reward = workers_reward.sum() * 1e3
         return -reward
@@ -307,19 +419,20 @@ def main():
     # shape = remesh(shape_gt, origin, shape_gt.get_dims())
     shape = shape_gt
 
-    max_workers = 1000
-    n_cycles: int = 10
-    steps_per_iteration: int = 120
+    max_workers = 3
+    n_cycles: int = 5
+    steps_per_iteration: int = 500
     bounds = torch.tensor([[-1., -1., -1.], [1., 1., 1.]])
-    algo = XxRollingBehavior(shape, max_workers, 0.03, n_cycles, steps_per_iteration, bounds=bounds)
+    algo = XxRollingBehavior(shape, max_workers, 0.1, n_cycles, steps_per_iteration, bounds=bounds)
     algo.optimize()
     algo.visualize()
     print(algo.workers.aabb)
-    # TODO: Spawn them on the surface, not in the interior. Also, can I somehow "close" the shape again?
-    # TODO: See how it works if theres really A LOT of them
-    # TODO: Stop the workers before they reach the bounds, leave the others running
+    # TODO: Can I somehow "close" the shape again?
+    # TODO: Currently, there is a problem because the inertia decreases quadratically with the "relevance" that increases
+    #   slower, so once the carving workers touch the surface, they refuse to go in and instead just grow.
 
 
 if __name__ == "__main__":
     torch.set_default_device('cuda')
+    torch.manual_seed(0)
     main()

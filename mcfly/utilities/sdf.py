@@ -190,7 +190,8 @@ class Sdf(ABC):
     def get_surface_points(self,
                            center: torch.Tensor,
                            dims: Iterable[float],
-                           refinement_steps: int = 6,
+                           refinement_steps: int = 9,
+                           limit_to: Optional[str] = None
                            ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns the points and their normals of the SDF.
@@ -201,6 +202,8 @@ class Sdf(ABC):
             refinement_steps: How many times to refine the grid. The final resolution of the grid will be
                 $\frac{dims}{8^refinement_steps}$. $6$ seems to be a good and reasonably fast default, 7 already takes
                 seconds to compute. Naturally, with one more step, the computation times is multiplied by ~8.
+            limit_to: If 'interior' or 'exterior' is provided, the surface points will be limited to points on this
+                side of the SDF. Important for boolean operations.
         """
         sph_rad = np.sqrt(3) / 2
         if not isinstance(dims, torch.Tensor):
@@ -217,8 +220,14 @@ class Sdf(ABC):
             else:
                 d, g = self(query, gradients=True)
                 mask = torch.abs(d) < sph_rad * dims.max()
-                surface = query[mask][..., :3]
-                normals = g[mask][..., :3] * torch.sign(d[mask]).unsqueeze(-1)
+                if limit_to == 'interior':
+                    mask = mask & (d > 0)
+                elif limit_to == 'exterior':
+                    mask = mask & (d < 0)
+                surface = query[mask]
+                normals = g[mask][:, :3]
+                # Assuming the normals are correct, this will directly give us the surface points
+                surface = surface[:, :3] - (d[mask] - query[mask, 3]).unsqueeze(-1) * normals
         return surface, normals
 
     def plot(self,
@@ -276,8 +285,10 @@ class Sdf(ABC):
                 center: torch.Tensor,
                 dims: Sequence[float],
                 pts_per_dim: int,
-                hide_threshold: float = 0.0
-                ):
+                hide_threshold: float = 0.0,
+                show: bool = True,
+                save_at: Optional[str] = None,
+                ) -> pv.Plotter:
         """
         Visualizes the SDF as a 3D plot.
         """
@@ -293,19 +304,28 @@ class Sdf(ABC):
 
         scale = np.mean(dims)
         pts = np.stack(grid, axis=-1)
-        pv.plot(pts,
-                scalars=d,
-                style='points_gaussian',
-                render_points_as_spheres=True,
-                point_size=10 / scale,
-                show_scalar_bar=False
-                )
+
+        plotter = pv.Plotter()
+        plotter.add_axes()
+        plotter.add_points(pts,
+                           scalars=d,
+                           style='points_gaussian',
+                           render_points_as_spheres=True,
+                           point_size=10 / scale,
+                           show_scalar_bar=False,
+                           )
+        if show:
+            plotter.show()
+        if save_at is not None:
+            plotter.save_graphic(save_at)
+        return plotter
 
     def reconstruct_surface_poisson(self,
                                     center: Optional[torch.Tensor] = None,
                                     dims: Optional[Iterable[float]] = None,
                                     refinement_steps: int = 6,
-                                    fix_mesh: bool = True
+                                    fix_mesh: bool = True,
+                                    limit_to: Optional[str] = None
                                     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Tries to reconstrunct the surface by sampling the SDF and using Poisson reconstruction.
@@ -318,12 +338,13 @@ class Sdf(ABC):
             refinement_steps: How many times to refine the grid AND the reconstruction. The final resolution of the grid
             will be $\frac{dims}{8^refinement_steps}$. $6$ seems to be a good and reasonably fast default.
             fix_mesh: Whether to fix the mesh after reconstruction. This is recommended, but takes additional time.
+            limit_to: You can limit the surface reconstruction to points in the 'interior' or 'exterior' of the SDF.
         Returns: (vertices, faces)
         """
-        points, normals = self.get_surface_points(center, dims, refinement_steps=refinement_steps)
+        points, normals = self.get_surface_points(center, dims, refinement_steps=refinement_steps, limit_to=limit_to)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points.detach().cpu().numpy())
-        pcd.normals = o3d.utility.Vector3dVector(normals.detach().cpu().numpy())
+        pcd.normals = o3d.utility.Vector3dVector(-normals.detach().cpu().numpy())
         surface, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd=pcd, depth=refinement_steps)
         v, f = np.asarray(surface.vertices), np.asarray(surface.triangles)
         if fix_mesh:
@@ -334,9 +355,10 @@ class Sdf(ABC):
                center: torch.Tensor,
                dims: torch.Tensor,
                refinement_steps: int = 6,
+               limit_to: Optional[str] = None
                ) -> CuroboMeshSdf:
         """Resamples the surface and returns the mesh for the new shape."""
-        v, f = self.reconstruct_surface_poisson(center, dims, refinement_steps=refinement_steps)
+        v, f = self.reconstruct_surface_poisson(center, dims, refinement_steps=refinement_steps, limit_to=limit_to)
         return CuroboMeshSdf.from_meshes(
             [Mesh(
                 name='remeshed', vertices=v.astype(np.float32).tolist(),
@@ -415,23 +437,26 @@ class BoundedSdf(Sdf, ABC):
     def get_surface_points(self,
                            center: Optional[torch.Tensor] = None,
                            dims: Optional[Iterable[float]] = None,
-                           refinement_steps: int = 6,
+                           refinement_steps: int = 9,
+                           limit_to: Optional[str] = None
                            ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns the points and their normals of the SDF."""
         center = self.get_center() if center is None else center
         dims = self.get_dims() if dims is None else dims
-        return super().get_surface_points(center, dims, refinement_steps)
+        return super().get_surface_points(center, dims, refinement_steps, limit_to)
 
     def pv_plot(self,
                 center: Optional[torch.Tensor] = None,
                 dims: Optional[Sequence[float]] = None,
                 pts_per_dim: int = 60,
-                hide_threshold: float = 0.0
-                ):
+                hide_threshold: float = 0.0,
+                show: bool = True,
+                save_at: Optional[str] = None,
+                ) -> pv.Plotter:
         """Adds defaults to the super class plot method."""
         center = center if center is not None else self.get_center()
         dims = dims if dims is not None else self.get_dims()
-        return super().pv_plot(center, dims, pts_per_dim, hide_threshold)
+        return super().pv_plot(center, dims, pts_per_dim, hide_threshold, show, save_at)
 
     def plot_reconstructed_surface(self,
                                    center: Optional[torch.Tensor] = None,
@@ -446,11 +471,12 @@ class BoundedSdf(Sdf, ABC):
                                     center: Optional[torch.Tensor] = None,
                                     dims: Optional[Iterable[float]] = None,
                                     refinement_steps: int = 6,
-                                    fix_mesh: bool = True
+                                    fix_mesh: bool = True,
+                                    limit_to: Optional[str] = None
                                     ) -> Tuple[np.ndarray, np.ndarray]:
         center = self.get_center() if center is None else center
         dims = self.get_dims() if dims is None else dims
-        return super().reconstruct_surface_poisson(center, dims, refinement_steps, fix_mesh)
+        return super().reconstruct_surface_poisson(center, dims, refinement_steps, fix_mesh, limit_to)
 
 class CuroboMeshSdf(BoundedSdf):
     """A signed distance function representing a curobo mesh."""

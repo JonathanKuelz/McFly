@@ -1,5 +1,6 @@
 hard_link*.py
 .idea*
+plots/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
