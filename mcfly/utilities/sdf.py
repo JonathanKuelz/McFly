@@ -417,6 +417,11 @@ class CallableSdf(Sdf):
 class BoundedSdf(Sdf, ABC):
     """An SDF that is aware of its boundaries."""
 
+    @property
+    def aabb(self) -> torch.Tensor:
+        """Returns the axis-aligned bounding box of the SDF."""
+        return torch.stack([self.get_center() - self.get_dims() / 2, self.get_center() + self.get_dims() / 2])
+
     @abstractmethod
     def get_center(self) -> torch.Tensor:
         """Returns the center of the SDF."""

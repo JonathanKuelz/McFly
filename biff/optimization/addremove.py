@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Callable,  List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from faker import Faker
 import numpy as np
@@ -11,6 +10,7 @@ import torch
 from torch.autograd import Function
 from tqdm import tqdm
 
+from docbrown.templates.warp_sim import WarpSim
 from mcfly.utilities.file_locations import PLOTS
 from mcfly.utilities.sdf import BoundedSdf, Sdf, SphereSdf
 
@@ -41,7 +41,7 @@ class Worker:
         self.active = torch.ones(self.center.shape[0], dtype=torch.bool).to(self.center.device)
         self.add_material: bool = False
         self.carve_material: bool = False
-        self._score: torch.Tensor = torch.zeros(self.num_workers).to(self.center.device)
+        self._score: torch.Tensor = torch.ones(self.num_workers).to(self.center.device)
 
     @property
     def aabb(self) -> torch.Tensor:
@@ -228,7 +228,10 @@ class AddRemoveAlgorithm(ABC):
                  n_cycles: int,
                  steps_per_cycle: int,
                  bounds: Optional[torch.Tensor] = None,
+                 interactive: bool = False,
                  *,
+                 perform_add_material: bool = True,
+                 perform_carve_material: bool = True,
                  viz_every: int = 0,
                  get_optimizer: Callable[[AddRemoveAlgorithm, List[torch.Tensor]], torch.optim.Optimizer] = None,
                  worker_sampling: str = 'grid'
@@ -237,10 +240,15 @@ class AddRemoveAlgorithm(ABC):
         Args:
             base_shape (BoundedSdf): The base shape to optimize.
             max_workers (int): The maximum number of workers.
-            worker_radius (float): The radius of the workers.
+            worker_radius (float): The radius of the workers that are going to add their body to the shape. The removing
+                workers will have twice the radius, but are only allowed to enter the material with half their body.
             n_cycles (int): The number of add/remove cycles to run.
             steps_per_cycle (int): The number of steps per cycle.
             bounds (Optional[torch.Tensor]): The bounds for the workers. Should be 2x3 with the min and max bounds.
+            perform_add_material (bool): If set to false, the "adding material" part of the algorithm is disabled.
+            perform_carve_material (bool): If set to false, the "removing material" part of the algorithm is disabled.
+            interactive (bool): If set to true, the algorithm will open intermediate visualizations. They need to be
+                closed manually for the algorithm to continue.
             viz_every (int): The number of cycles to visualize the shape.
             get_optimizer (Callable[[List[torch.Tensor]], torch.optim.Optimizer]): A function that takes parameters
                 and returns an optimizer.
@@ -251,6 +259,9 @@ class AddRemoveAlgorithm(ABC):
         self.center = self.base_shape.get_center()
         self.shape = base_shape
         self.last_shape = self.base_shape
+        self.perform_add_material = perform_add_material
+        self.perform_carve_material = perform_carve_material
+        self.interactive = interactive
         self.viz_every = viz_every
 
         self.random_sampling = worker_sampling == 'random'
@@ -277,28 +288,33 @@ class AddRemoveAlgorithm(ABC):
     def default_optim(algo, params: List[torch.Tensor]) -> torch.optim.Optimizer:
         """Default optimizer for the workers."""
         return torch.optim.SGD([
-            {'params': params[0], 'lr': 1e-2, 'name': 'center'},
+            {'params': params[0], 'lr': 1e-3, 'name': 'center'},
             {'params': params[1], 'lr': 1e-4, 'name': 'radius'}
         ])
 
     def optimize(self):
         """Optimize the workers to add material to the shape."""
         for cycle in range(self.n_cycles):
-            print(f"Cycle {cycle + 1}/{self.n_cycles}")
-            self._add_material()
-            if self.viz_every > 0 and cycle % self.viz_every == 0:
-                self.visualize_with_workers()
+            self.step_one_cycle(cycle)
 
+    def step_one_cycle(self, cycle: int):
+        print(f"Cycle {cycle + 1}/{self.n_cycles}")
+        if self.perform_add_material:
+            self._add_material()
+            if self.interactive and self.viz_every > 0 and cycle % self.viz_every == 0:
+                self.visualize_with_workers()
             self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7, limit_to='exterior')
 
+        if self.perform_carve_material:
             self._remove_material()
-            if self.viz_every > 0 and cycle % self.viz_every == 0:
+            if self.interactive and self.viz_every > 0 and cycle % self.viz_every == 0:
                 self.visualize_with_workers()
                 self.shape.plot_reconstructed_surface(self.center, self.bounds[1] - self.bounds[0], refinement_steps=7)
             self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7, limit_to='interior')
-            self.last_shape = self.shape
+        self.last_shape = self.shape
 
-    def optimization_cycle(self):
+
+    def let_them_work(self):
         """Moves the workers to the exterior to expand the current shape."""
         optim = self.get_optimizer(self, self.workers.optimization_parameters)
         for step in tqdm(range(self.add_steps), desc=f"{'Adding' if self.workers.add_material else 'Removing'} material"):
@@ -307,7 +323,7 @@ class AddRemoveAlgorithm(ABC):
             if step == 0:
                 tqdm.write('Initial scores: ' + str(self.workers.score.sum().item()))
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.workers.optimization_parameters, 1.)
+            # torch.nn.utils.clip_grad_norm_(self.workers.optimization_parameters, 1.)
             optim.step()
             self.shape = self.workers.work_on_shape(self.shape)
             self._set_worker_active()
@@ -366,14 +382,14 @@ class AddRemoveAlgorithm(ABC):
         self.workers = Worker(self._sample(interior=True), radius=self.worker_radius)
         self.workers.enable_addition()
         self._set_worker_active()
-        self.optimization_cycle()
+        self.let_them_work()
 
     def _remove_material(self):
         """Add material to the shape."""
         self.workers = Worker(self._sample(interior=False), radius=self.worker_radius * 2)
         self.workers.enable_carving()
         self._set_worker_active()
-        self.optimization_cycle()
+        self.let_them_work()
 
     def _check_bounds(self):
         """Makes sure the workers are not working outside their bounds."""
@@ -387,7 +403,7 @@ class AddRemoveAlgorithm(ABC):
         """Checks which of the current workers are within the bounds."""
         outer_positions = self.workers.center
         bounds = self.bounds
-        if self.workers.add_material:  # Worker body contributes towards shape
+        if self.workers.add_material:
             outer_positions = outer_positions + torch.sign(self.workers.center) * self.workers.radius
             bounds = bounds * add_phase_threshold
         return torch.logical_and((outer_positions > bounds[0]).all(dim=1), (outer_positions < bounds[1]).all(dim=1))
@@ -419,49 +435,73 @@ class AddRemoveAlgorithm(ABC):
         if interior:
             workers = surface + (self.worker_radius - d[selection]).unsqueeze(-1) * safety_factor * normals[selection]
         else:
-            # TODO: Properly document the factor 2
+            # For factor 2 see docstring of this class
             workers = surface - (self.worker_radius * 2 - d[selection]).unsqueeze(-1) * safety_factor * normals[selection]
         return workers
 
 
+class AddRemoveSimulateAlgorithm(AddRemoveAlgorithm):
+    """An extension of the addremove algorithm that backpropagates gradients from a simulation."""
 
-class XxRollingBehavior(AddRemoveAlgorithm):
+    def __init__(self, sim_kwargs, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.latest_sim_gradients = {}
+        self.sim: Optional[WarpSim] = None
+        self.sim_name = sim_kwargs.pop('name')
+        self.sim_kwargs = sim_kwargs
 
-    def loss(self):
-        """
-        A weighted sum of inertia terms. Those that contribute in a "good" way are pushed to become more relevant, those
-        that contribute in a "bad" way are pushed to become less relevant.
+    @abstractmethod
+    def construct_builder(self):
+        pass
 
-        Workers can "contribute" (be in contact with) a shape, and/or have desireable properties or not.
-        - Does not contribute: Push the worker closer to the surface
-        - Contributes: If the worker is "good" (i.e. has a positive inertia), try increase its relevance. If it is "bad",
-            prioritize its reward.
-        """
-        inertia = self.workers.get_worker_inertia(self.center)
-        score = 1.2 * inertia[:, 0, 0] - inertia[:, 1, 1] - inertia[:, 2, 2]
-        self.workers.score = score.detach()
-        good_reward = self.workers.score > 0
-        relevance, contributes = self.workers.get_relevance(self.last_shape)
-        optimize_score = torch.logical_or(~contributes, good_reward)
-        reward = relevance[optimize_score].sum() + score[~optimize_score].sum()
-        return -reward
+    @abstractmethod
+    def make_sim(self, cycle: int):
+        """Create the simulation."""
+        pass
 
+    def optimize(self):
+        for cycle in range(self.n_cycles):
+            self.make_sim(cycle)
+            self.sim.launch()
+            self.latest_sim_gradients = self.get_sim_gradients()
+            self.step_one_cycle(cycle)
 
-def main():
-    radius = 0.5
-    shape_gt: BoundedSdf = SphereSdf(torch.tensor([[0., 0., 0., radius]]))
-    shape = shape_gt
+    def let_them_work(self):
+        """Moves the workers to the exterior to expand the current shape."""
+        optim = self.get_optimizer(self, self.workers.optimization_parameters)
+        for step in tqdm(range(self.add_steps), desc=f"{'Adding' if self.workers.add_material else 'Removing'} material"):
+            optim.zero_grad()
+            loss = self.loss()
+            if step == 0:
+                tqdm.write('Initial scores: ' + str(self.workers.score.sum().item()))
+            if loss is not None:
+                loss.backward()
+            self.write_simulation_gradients()
+            for param in self.workers.optimization_parameters:
+                # Scale the parameters s.t. the worker with the largest gradient has gradnorm 1
+                norms = param.grad.norm(dim=-1)
+                param.grad = param.grad / norms.max()
+            optim.step()
+            self.shape = self.workers.work_on_shape(self.shape)
+            self._set_worker_active()
+        tqdm.write('EOC scores: ' + str(self.workers.score.sum().item()))
 
-    max_workers = 256
-    n_cycles: int = 15
-    steps_per_iteration: int = 250
-    bounds = torch.tensor([[-1., -1., -1.], [1., 1., 1.]])
-    algo = XxRollingBehavior(shape, max_workers, 0.1, n_cycles, steps_per_iteration, bounds=bounds,
-                             viz_every=3)
-    algo.optimize()
-    algo.shape.plot_reconstructed_surface(algo.center, algo.bounds[1] - algo.bounds[0], refinement_steps=7)
+    @abstractmethod
+    def get_sim_gradients(self) -> Dict[str, torch.Tensor]:
+        """Get the shape gradients from the latest simulation."""
+        pass
 
-if __name__ == "__main__":
-    torch.set_default_device('cuda')
-    torch.manual_seed(0)
-    main()
+    def write_simulation_gradients(self):
+        # TODO: Default + inheritance
+        if 'inertia' in self.latest_sim_gradients:
+            inertia = self.workers.get_worker_inertia(self.center)
+            incoming_grads = self.latest_sim_gradients['inertia'].broadcast_to(inertia.shape)
+            inertia.backward(incoming_grads)
+        if 'mass' in self.latest_sim_gradients:
+            mass = self.workers.mass
+            incoming_grads = self.latest_sim_gradients['mass'].broadcast_to(mass.shape)
+            mass.backward(incoming_grads)
+        if 'com' in self.latest_sim_gradients:
+            com = self.workers.center
+            incoming_grads = self.latest_sim_gradients['com'].broadcast_to(com.shape)
+            com.backward(incoming_grads)
