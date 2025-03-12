@@ -41,6 +41,7 @@ class Worker:
         self.active = torch.ones(self.center.shape[0], dtype=torch.bool).to(self.center.device)
         self.add_material: bool = False
         self.carve_material: bool = False
+        self._score: torch.Tensor = torch.zeros(self.num_workers).to(self.center.device)
 
     @property
     def aabb(self) -> torch.Tensor:
@@ -86,6 +87,16 @@ class Worker:
         return torch.maximum(self._radius, self._min_radius)
 
     @property
+    def score(self) -> torch.Tensor:
+        """The individual score (think: reward) the worker."""
+        return self._score[self.active]
+
+    @score.setter
+    def score(self, value: torch.Tensor):
+        """Set the individual score (think: reward) the worker."""
+        self._score[self.active] = value
+
+    @property
     def volume(self) -> torch.Tensor:
         """Compute the volume of the worker."""
         vol = (4. / 3.) * torch.pi * self.radius[self.active] ** 3
@@ -108,24 +119,23 @@ class Worker:
         self.add_material = False
         self.carve_material = True
 
-    def get_relevance_score(self, shape: Sdf) -> torch.Tensor:
+    def get_relevance(self, shape: Sdf) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Computes a score indicating how much the worker is changing the material.
+        Computes a score indicating how much the worker is changing the material. This assumes that a worker maximally
+        contributes to the shape if it is exactly at the surface of the shape. (which side depends on the mode)
 
         Args:
             shape (Sdf): The shape that the signed distance should be computed for. This should typicalle NOT be the
                 shape that is changed in every iteration, because this would lead to unstable gradients.
         """
         d, _g = QuerySdf.apply(self.query_shapes, shape, shape, True)
-        with torch.no_grad():
-            weight =  1 / self.radius[self.active].squeeze()
+        contributes = d > 0
+
         if self.add_material:
-            return torch.sigmoid(-d * weight) / torch.sigmoid(torch.tensor([-1])) # Higher scores fore being outside
+            optimal_d = torch.zeros_like(d)
         else:
-            if d.abs().mean() < 0.0001:
-                print()
-            shape(self.query_shapes)
-            return torch.sigmoid(d * weight) / torch.sigmoid(torch.tensor([1])) # Higher scores fore being inside
+            optimal_d = self.radius[self.active].squeeze()  # Intentionally just half interior to allow remeshing
+        return 1 - (d - optimal_d) ** 2, contributes
 
     def get_worker_inertia(self, origin: torch.Tensor) -> torch.Tensor:
         """Compute the approximated inertia that the workers add to a shape with reference coordinates at origin."""
@@ -149,6 +159,7 @@ class Worker:
             shape (Sdf): The shape to add the workers body to.
         """
         mask = shape(self.query_shapes) < self.radius[self.active].squeeze()
+        mask = torch.logical_and(mask, self.score > 0)
         if mask.sum() == 0:
             return shape
         worker_sdf = SphereSdf(self.query_shapes.detach().clone()[mask])
@@ -156,12 +167,13 @@ class Worker:
 
     def _carve_material(self, shape: Sdf):
         """
-        Remove the workers body from the shape if it is in the exterior.
+        Remove the workers body from the shape if it is in the interior.
 
         Args:
             shape (Sdf): The shape to remove the workers body
         """
         mask = shape(self.query_shapes) > 0
+        mask = torch.logical_and(mask, self.score > 0)
         if mask.sum() == 0:
             return shape
         worker_sdf = SphereSdf(self.query_shapes.detach().clone()[mask])
@@ -217,6 +229,7 @@ class AddRemoveAlgorithm(ABC):
                  steps_per_cycle: int,
                  bounds: Optional[torch.Tensor] = None,
                  *,
+                 viz_every: int = 0,
                  get_optimizer: Callable[[AddRemoveAlgorithm, List[torch.Tensor]], torch.optim.Optimizer] = None,
                  worker_sampling: str = 'grid'
                  ):
@@ -228,6 +241,7 @@ class AddRemoveAlgorithm(ABC):
             n_cycles (int): The number of add/remove cycles to run.
             steps_per_cycle (int): The number of steps per cycle.
             bounds (Optional[torch.Tensor]): The bounds for the workers. Should be 2x3 with the min and max bounds.
+            viz_every (int): The number of cycles to visualize the shape.
             get_optimizer (Callable[[List[torch.Tensor]], torch.optim.Optimizer]): A function that takes parameters
                 and returns an optimizer.
             worker_sampling (str): The sampling strategy to use. Either 'grid' or 'random'.
@@ -236,6 +250,8 @@ class AddRemoveAlgorithm(ABC):
         self.bounds = bounds
         self.center = self.base_shape.get_center()
         self.shape = base_shape
+        self.last_shape = self.base_shape
+        self.viz_every = viz_every
 
         self.random_sampling = worker_sampling == 'random'
         self.max_workers = max_workers
@@ -269,16 +285,18 @@ class AddRemoveAlgorithm(ABC):
         """Optimize the workers to add material to the shape."""
         for cycle in range(self.n_cycles):
             print(f"Cycle {cycle + 1}/{self.n_cycles}")
-            # self._add_material()
-            # self.visualize_with_workers()
-            # self.shape.plot_reconstructed_surface(self.center, self.bounds[1] - self.bounds[0])
-            #
-            # self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7, limit_to='exterior')
+            self._add_material()
+            if self.viz_every > 0 and cycle % self.viz_every == 0:
+                self.visualize_with_workers()
+
+            self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7, limit_to='exterior')
 
             self._remove_material()
-            self.visualize_with_workers()
-            self.shape.plot_reconstructed_surface(self.center, self.bounds[1] - self.bounds[0], refinement_steps=7)
+            if self.viz_every > 0 and cycle % self.viz_every == 0:
+                self.visualize_with_workers()
+                self.shape.plot_reconstructed_surface(self.center, self.bounds[1] - self.bounds[0], refinement_steps=7)
             self.shape = self.shape.remesh(self.center, self.bounds[1] - self.bounds[0], 7, limit_to='interior')
+            self.last_shape = self.shape
 
     def optimization_cycle(self):
         """Moves the workers to the exterior to expand the current shape."""
@@ -286,11 +304,14 @@ class AddRemoveAlgorithm(ABC):
         for step in tqdm(range(self.add_steps), desc=f"{'Adding' if self.workers.add_material else 'Removing'} material"):
             optim.zero_grad()
             loss = self.loss()
+            if step == 0:
+                tqdm.write('Initial scores: ' + str(self.workers.score.sum().item()))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.workers.optimization_parameters, 1.)
             optim.step()
             self.shape = self.workers.work_on_shape(self.shape)
             self._set_worker_active()
+        tqdm.write('EOC scores: ' + str(self.workers.score.sum().item()))
 
     def visualize(self):
         """Visualize the current shape."""
@@ -349,7 +370,7 @@ class AddRemoveAlgorithm(ABC):
 
     def _remove_material(self):
         """Add material to the shape."""
-        self.workers = Worker(self._sample(interior=False), radius=self.worker_radius)
+        self.workers = Worker(self._sample(interior=False), radius=self.worker_radius * 2)
         self.workers.enable_carving()
         self._set_worker_active()
         self.optimization_cycle()
@@ -398,7 +419,8 @@ class AddRemoveAlgorithm(ABC):
         if interior:
             workers = surface + (self.worker_radius - d[selection]).unsqueeze(-1) * safety_factor * normals[selection]
         else:
-            workers = surface - (self.worker_radius - d[selection]).unsqueeze(-1) * safety_factor * normals[selection]
+            # TODO: Properly document the factor 2
+            workers = surface - (self.worker_radius * 2 - d[selection]).unsqueeze(-1) * safety_factor * normals[selection]
         return workers
 
 
@@ -406,31 +428,38 @@ class AddRemoveAlgorithm(ABC):
 class XxRollingBehavior(AddRemoveAlgorithm):
 
     def loss(self):
+        """
+        A weighted sum of inertia terms. Those that contribute in a "good" way are pushed to become more relevant, those
+        that contribute in a "bad" way are pushed to become less relevant.
+
+        Workers can "contribute" (be in contact with) a shape, and/or have desireable properties or not.
+        - Does not contribute: Push the worker closer to the surface
+        - Contributes: If the worker is "good" (i.e. has a positive inertia), try increase its relevance. If it is "bad",
+            prioritize its reward.
+        """
         inertia = self.workers.get_worker_inertia(self.center)
-        scores = self.workers.get_relevance_score(self.base_shape)
-        workers_reward = (3 * inertia[:, 0, 0] - inertia[:, 1, 1] - inertia[:, 2, 2]) * scores
-        reward = workers_reward.sum() * 1e3
+        score = 1.2 * inertia[:, 0, 0] - inertia[:, 1, 1] - inertia[:, 2, 2]
+        self.workers.score = score.detach()
+        good_reward = self.workers.score > 0
+        relevance, contributes = self.workers.get_relevance(self.last_shape)
+        optimize_score = torch.logical_or(~contributes, good_reward)
+        reward = relevance[optimize_score].sum() + score[~optimize_score].sum()
         return -reward
 
 
 def main():
     radius = 0.5
     shape_gt: BoundedSdf = SphereSdf(torch.tensor([[0., 0., 0., radius]]))
-    # shape = remesh(shape_gt, origin, shape_gt.get_dims())
     shape = shape_gt
 
-    max_workers = 3
-    n_cycles: int = 5
-    steps_per_iteration: int = 500
+    max_workers = 256
+    n_cycles: int = 15
+    steps_per_iteration: int = 250
     bounds = torch.tensor([[-1., -1., -1.], [1., 1., 1.]])
-    algo = XxRollingBehavior(shape, max_workers, 0.1, n_cycles, steps_per_iteration, bounds=bounds)
+    algo = XxRollingBehavior(shape, max_workers, 0.1, n_cycles, steps_per_iteration, bounds=bounds,
+                             viz_every=3)
     algo.optimize()
-    algo.visualize()
-    print(algo.workers.aabb)
-    # TODO: Can I somehow "close" the shape again?
-    # TODO: Currently, there is a problem because the inertia decreases quadratically with the "relevance" that increases
-    #   slower, so once the carving workers touch the surface, they refuse to go in and instead just grow.
-
+    algo.shape.plot_reconstructed_surface(algo.center, algo.bounds[1] - algo.bounds[0], refinement_steps=7)
 
 if __name__ == "__main__":
     torch.set_default_device('cuda')

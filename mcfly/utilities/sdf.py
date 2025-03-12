@@ -166,7 +166,7 @@ class Sdf(ABC):
                 return torch.minimum(d1, -d2)
             d1, g1 = d1
             d2, g2 = d2
-            return torch.minimum(d1, -d2), torch.where((d1 <= -d2).unsqueeze(1), g1, g2)
+            return torch.minimum(d1, -d2), torch.where((d1 <= -d2).unsqueeze(1), g1, -g2)
 
         return CallableSdf(query_function)
 
