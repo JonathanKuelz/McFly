@@ -1,7 +1,7 @@
 import torch
 
 from biff.optimization.addremove import AddRemoveAlgorithm
-from mcfly.utilities.sdf import BoundedSdf, SphereSdf
+from mcfly.representations.sdf import BoundedSdf, SphereSdf
 
 
 class XxRollingBehavior(AddRemoveAlgorithm):

@@ -4,7 +4,7 @@ import torch
 
 from docbrown.utilities.geometry import pv_to_trimesh
 from mcfly.utilities.curobo import trimesh_to_curobo_mesh
-from mcfly.utilities.sdf import CuroboMeshSdf
+from mcfly.representations.sdf import CuroboMeshSdf
 
 
 def main():

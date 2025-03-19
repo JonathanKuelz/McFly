@@ -12,9 +12,9 @@ import torch
 import trimesh
 import pyvista as pv
 
-from docbrown.utilities.geometry import pv_to_trimesh, show_as_pv_mesh, show_pv_mesh
-from mcfly.utilities.curobo import get_sdf, stack_spheres, trimesh_to_curobo_mesh
-from mcfly.utilities.sdf import CuroboMeshSdf, SphereSdf
+from docbrown.utilities.geometry import pv_to_trimesh, show_pv_mesh
+from mcfly.utilities.curobo import trimesh_to_curobo_mesh
+from mcfly.representations.sdf import CuroboMeshSdf, SphereSdf
 
 
 def make_finger_mesh():

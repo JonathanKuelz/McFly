@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from docbrown.templates.warp_sim import WarpSim
 from mcfly.utilities.file_locations import PLOTS
-from mcfly.utilities.sdf import BoundedSdf, Sdf, SphereSdf
+from mcfly.representations.sdf import BoundedSdf, Sdf, SphereSdf
 
 
 def parallel_axis_theorem(i_com: torch.Tensor, m: torch.Tensor, d: torch.Tensor):

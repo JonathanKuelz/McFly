@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from biff.optimization.pygmo import UdpWithGradient
-from mcfly.utilities.sdf import CuroboMeshSdf, Sdf, SphereSdf
+from mcfly.representations.sdf import CuroboMeshSdf, Sdf, SphereSdf
 
 class MoveToContactPoint(UdpWithGradient):
     """

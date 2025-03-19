@@ -1,16 +1,13 @@
-import time
-
-from curobo.types.math import Pose
 import numpy as np
 import pyvista as pv
 import torch
 
-from biff.geometry.boolean_ball_sdf import make_finger_mesh, plot_inertia_deltas
-from biff.optimization.grasp import DeformGrasp, MoveToContactPoint
-from biff.optimization.pygmo import optimize_udp, scipy_udp, udp_sgd
+from biff.geometry.boolean_ball_sdf import make_finger_mesh
+from biff.optimization.grasp import DeformGrasp
+from biff.optimization.pygmo import scipy_udp, udp_sgd
 from docbrown.utilities.geometry import pv_to_trimesh
-from mcfly.utilities.curobo import get_sdf, trimesh_to_curobo_mesh
-from mcfly.utilities.sdf import CuroboMeshSdf, SphereSdf
+from mcfly.utilities.curobo import trimesh_to_curobo_mesh
+from mcfly.representations.sdf import CuroboMeshSdf, SphereSdf
 
 
 def main(discretize: bool = False):
