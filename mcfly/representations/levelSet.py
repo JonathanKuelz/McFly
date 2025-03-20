@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Union
 
 import numpy as np
+import skfmm
 from skimage.measure import marching_cubes
 import torch
 from trimesh import Trimesh
@@ -30,6 +31,20 @@ class LevelSetRepresentation:
             self._check_sanity()
 
     @property
+    def aabb(self, level: Optional[float] = None) -> torch.Tensor:
+        """Returns the axis-aligned bounding box of the level set function."""
+        if level is None:
+            level = self._default_level
+        interior = self.get_interior_mask(level)
+        interior_points = self.grid_tensor[interior]
+        return torch.stack([interior_points.min(dim=0)[0], interior_points.max(dim=0)[0]])
+
+    @property
+    def center(self) -> torch.Tensor:
+        """Returns the center of the grid."""
+        return (self.grid_tensor[0, 0, 0] + self.grid_tensor[-1, -1, -1]) / 2
+
+    @property
     def dim(self) -> int:
         return len(self._grid)
 
@@ -42,6 +57,16 @@ class LevelSetRepresentation:
     def level_set_numpy(self) -> np.ndarray:
         """Returns the current level set function as 3D numpy array."""
         return self._level_set_function.detach().cpu().numpy()
+
+    @property
+    def mean_curvature(self) -> torch.Tensor:
+        """Computes the mean curvature of the level set function using numeric differentiation."""
+        # TODO: Not sure if this is correct -- results seem reasonable but not exactly as expected
+        dx, dy, dz = map(lambda x: x.item(), self.spacing[:, 1] - self.spacing[:, 0])
+        normal = self.normals
+        # div F = dF_x / dx + dF_y / dy + dF_z / dz
+        kappa = sum(torch.gradient(normal[..., i], spacing=s, dim=i)[0] for s, i in zip((dx, dy, dz), range(3)))
+        return kappa
 
     @property
     def normals(self) -> torch.Tensor:
@@ -67,6 +92,18 @@ class LevelSetRepresentation:
             step = torch.einsum('ijkl,ijkl->ijk', v, self.normals)
         self._level_set_function = self._level_set_function + dt * step
 
+    def get_interior_mask(self, level: Optional[float] = None) -> torch.Tensor:
+        """Returns a mask of the interior points of the level set function."""
+        if level is None:
+            level = self._default_level
+        return self._level_set_function >= level
+
+    def get_isosurface_mask(self, level: Optional[float] = None, eps: float = 1e-3) -> torch.Tensor:
+        """Returns a mask of the grid for all values within eps of level."""
+        if level is None:
+            level = self._default_level
+        return torch.abs(self._level_set_function - level) <= eps
+
     def get_mesh_data(self, level: Optional[float] = None):
         """Performs a reinitialization using the marching cubes algorithm."""
         if level is None:
@@ -82,8 +119,12 @@ class LevelSetRepresentation:
         return Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
 
     def reinitialize(self):
-        """Reinitializes the level set function."""
-        raise NotImplementedError()  # scikit-fmm
+        """Reinitializes the level set function using the fast marching method."""
+        dx, dy, dz = map(lambda x: x.item(), self.spacing[:, 1] - self.spacing[:, 0])
+        if not dx == dy == dz:
+            raise ValueError("Reinitialization currently assumes a uniformly spaced grid in all dimensions.")
+        sdf = skfmm.distance(self.level_set_numpy) * dx
+        self._level_set_function = torch.tensor(sdf).to(self._level_set_function)
 
     def _check_sanity(self):
         """Checks the sanity of the level set function, the provided dimensions etc."""

@@ -37,8 +37,13 @@ class PointMass:
         """Number of point masses."""
         return self.p_flat.shape[0]
 
+    def com(self, center: torch.Tensor):
+        """Compute the center of mass contribution of the point mass with respect to a coordinate system placed in center."""
+        com = self.p / self.m.unsqueeze(-1)
+        return com - center
+
     def inertia(self, center: torch.Tensor):
-        """Compute the inertia of the worker with respect to a coordinate system placed in center."""
+        """Compute the inertia of the point mass with respect to a coordinate system placed in center."""
         d = self.p_flat - center
         i_com = torch.zeros(self.num_points, 3, 3, device=self.p.device)
         i = parallel_axis_theorem(i_com, self.m_flat.unsqueeze(-1), d)
