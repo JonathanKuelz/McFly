@@ -1,4 +1,4 @@
-from typing import Sequence
+from typing import Optional, Sequence
 
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -28,7 +28,11 @@ def animate(meshes: Sequence[Trimesh],
     ani = FuncAnimation(fig, update, frames=len(meshes), interval=dt * 1000)
     ani.save(save_path)
 
-def show_hist(history: Sequence[Trimesh], grid: torch.Tensor, max_columns: int = 4):
+def show_hist(history: Sequence[Trimesh],
+              grid: torch.Tensor,
+              max_columns: int = 4,
+              title: Optional[str] = None,
+              ):
     """Visualizes the history of meshes."""
     history = tuple(history)
     n = len(history)
@@ -45,6 +49,9 @@ def show_hist(history: Sequence[Trimesh], grid: torch.Tensor, max_columns: int =
         mesh.set_facecolor('cyan')
         ax.add_collection3d(mesh)
         setup_axis(ax, grid)
+
+    if title is not None:
+        fig.suptitle(title, fontsize=16)
 
     plt.tight_layout()
     plt.show()

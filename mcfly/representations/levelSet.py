@@ -72,7 +72,9 @@ class LevelSetRepresentation:
     def normals(self) -> torch.Tensor:
         """Computes the normals of the level set function using numeric differentiation."""
         grad = torch.stack(torch.gradient(self._level_set_function, spacing=list(self.spacing)), dim=-1)
-        return -grad / torch.linalg.norm(grad, dim=-1, keepdim=True)
+        n = -grad / torch.linalg.norm(grad, dim=-1, keepdim=True)
+        n[torch.isnan(n)] = 0  # This is true for all points with equal distance to multiple surface points
+        return n
 
     @property
     def spacing(self) -> torch.Tensor:
@@ -125,6 +127,18 @@ class LevelSetRepresentation:
             raise ValueError("Reinitialization currently assumes a uniformly spaced grid in all dimensions.")
         sdf = skfmm.distance(self.level_set_numpy) * dx
         self._level_set_function = torch.tensor(sdf).to(self._level_set_function)
+
+    def soft_surface_dirac(self, eps_sign: Optional[float] = None):
+        """
+        Get a relaxed version of the surface Dirac delta function.
+
+        See Allaire et al., "Structural optimization using sensitivity analysis and a level set method", 2004, p. 22
+        """
+        if eps_sign is None:
+            dx, dy, dz = map(lambda x: x.item(), self.spacing[:, 1] - self.spacing[:, 0])
+            eps_sign = max(dx, dy, dz) / 20  # Should result in the surface being ~2 cells wide
+        signum = self._level_set_function / torch.sqrt(self._level_set_function ** 2 + eps_sign ** 2)
+        return sum(g.abs() for g in torch.gradient(signum)) / 3
 
     def _check_sanity(self):
         """Checks the sanity of the level set function, the provided dimensions etc."""

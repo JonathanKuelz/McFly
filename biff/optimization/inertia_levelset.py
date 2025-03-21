@@ -20,7 +20,9 @@ def main():
     loss = (2.5 * inertia[..., 0, 0] - inertia[..., 1, 1] - inertia[..., 2, 2])
     loss.backward()
     v = point_masses.p.grad
-    v = v / torch.linalg.norm(v, dim=-1, keepdim=True)
+    # v = level_set.normals * torch.einsum('ijkl,ijkl->ijk', v, level_set.normals).unsqueeze(-1)
+    # v = v / torch.linalg.norm(v, dim=-1, keepdim=True)
+    v = v / torch.linalg.norm(v, dim=-1).max() * 1.5
 
     for i in range(36):
         level_set.evolve(v, 0.01)

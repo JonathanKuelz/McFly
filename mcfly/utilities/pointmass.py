@@ -7,20 +7,20 @@ from biff.optimization.addremove import parallel_axis_theorem
 
 class PointMass:
 
-    def __init__(self, p: torch.Tensor, m: Union[torch.Tensor, float]):
+    def __init__(self, p: torch.Tensor, m_nominal: Union[torch.Tensor, float]):
         """
-        Initializes point masses.
+        Initializes point masses, intended as a discrete representation for Level Set Methods.
 
         Args:
             p (torch.Tensor): Position of the point masses. Should be of shape (..., 3).
-            m (Union[torch.Tensor, float]): Mass of the point mass. Either a single value that is broadcast to all
-                point masses or a tensor of the same shape as p.
+            m_nominal (Union[torch.Tensor, float]): Mass of the point mass. Either a single value that is broadcast to
+                all point masses or a tensor of the same shape as p.
         """
         p = p.detach().clone().requires_grad_()
         self.p = p
-        if not isinstance(m, torch.Tensor):
-            m = m * torch.ones_like(p[..., 0])
-        self.m = m
+        if not isinstance(m_nominal, torch.Tensor):
+            m_nominal = m_nominal * torch.ones_like(p[..., 0])
+        self.m_nominal = m_nominal.requires_grad_(True)
 
     @property
     def p_flat(self) -> torch.Tensor:
@@ -48,3 +48,20 @@ class PointMass:
         i_com = torch.zeros(self.num_points, 3, 3, device=self.p.device)
         i = parallel_axis_theorem(i_com, self.m_flat.unsqueeze(-1), d)
         return i.view(*self.p.shape, 3)
+
+    @property
+    def m(self):
+        return self.m_nominal
+    #
+    # def mass(self, level_set_values: torch.Tensor):
+    #     """
+    #     You could think the mass of a pointmass is constant, but it is not that easy: In Level Set Methods, points
+    #     either belong to a surface, or they do not. The mass plays an important role in computing other attributes like
+    #     inertia. We need to consider a "continuous relaxation" of the "mass contribution" to the implicit shape to
+    #     pass gradients through things like inertia computation back to the level set function value of the point, which
+    #     we do by implementing a soft mass.
+    #     """
+    #     # Linear interpolation
+    #     min_score = 0.2
+    #     max_score = 1.
+    #     scores =
