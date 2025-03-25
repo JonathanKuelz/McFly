@@ -6,13 +6,14 @@ from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Uni
 
 from curobo.geom.sdf.world import CollisionCheckerType, WorldCollisionConfig
 from curobo.geom.sdf.world_mesh import WorldMeshCollision
-from curobo.geom.transform import pose_inverse
+from curobo.geom.transform import pose_inverse, pose_to_matrix
 from curobo.geom.types import Mesh, WorldConfig
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
 import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
+from pyglet.shapes import vertex_source
 import pymeshfix
 import pyvista as pv
 import torch
@@ -307,6 +308,7 @@ class Sdf(ABC):
 
         plotter = pv.Plotter()
         plotter.add_axes()
+        plotter.add_axes_at_origin()
         plotter.add_points(pts,
                            scalars=d,
                            style='points_gaussian',
@@ -460,7 +462,7 @@ class BoundedSdf(Sdf, ABC):
                 ) -> pv.Plotter:
         """Adds defaults to the super class plot method."""
         center = center if center is not None else self.get_center()
-        dims = dims if dims is not None else self.get_dims()
+        dims = dims if dims is not None else self.get_dims() * 1.1
         return super().pv_plot(center, dims, pts_per_dim, hide_threshold, show, save_at)
 
     def plot_reconstructed_surface(self,
@@ -500,9 +502,8 @@ class CuroboMeshSdf(BoundedSdf):
         query_spheres = {'query_spheres': pts.view(1, 1, -1, 4)}
         sdf_info = get_sdf(query_spheres, self.wcm)
         if gradients:
-            grads = sdf_info['query_spheres'].grad
-            grads[..., 3] = 1.  # dd/dr is 1, but CuRobo does not provide this
-            return sdf_info['query_spheres'].distances, grads
+            grads = sdf_info['query_spheres'].grad.view(1, 1, -1, 4)
+            return sdf_info['query_spheres'].distances, grads[..., :3]
         return sdf_info['query_spheres'].distances
 
     @classmethod
@@ -519,17 +520,23 @@ class CuroboMeshSdf(BoundedSdf):
         world_collision = WorldMeshCollision(ccfg)
         return cls(world_collision)
 
+    def _get_vertex_positions(self) -> torch.Tensor:
+        vertices = [m.vertices for m in self.wcm.world_model.mesh]
+        positions = list()
+        for pose, vert in zip(self.mesh_poses, vertices):
+            mat = pose_to_matrix(pose[None, :3], pose[None, 3:])
+            vert = torch.concat([torch.tensor(vert), torch.ones(*vert.shape[:-1], 1)], dim=-1).to(mat)
+            positions.append(torch.einsum('nij,nj->ni', mat, vert)[..., :3].reshape(-1, 3))
+        return torch.concat(positions, dim=0)
+
     def get_center(self) -> torch.Tensor:
         """Approximates the center of the SDF"""
-        vertices = torch.tensor([m.vertices for m in self.wcm.world_model.mesh])
-        for i, offset in enumerate(self.mesh_poses):
-            vertices[i] += offset[:3]
-        vertices = vertices.view(-1, 3)
+        vertices = self._get_vertex_positions()
         return (torch.max(vertices, dim=0)[0] + torch.min(vertices, dim=0)[0]) / 2
 
     def get_dims(self) -> torch.Tensor:
         """Approximates the dimensions of the SDF"""
-        vertices = torch.tensor(list(chain.from_iterable(m.vertices for m in self.wcm.world_model.mesh)))
+        vertices = self._get_vertex_positions()
         return torch.max(vertices, dim=0)[0] - torch.min(vertices, dim=0)[0]
 
     def translate(self, t: torch.Tensor):

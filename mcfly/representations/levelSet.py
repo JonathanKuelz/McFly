@@ -49,6 +49,11 @@ class LevelSetRepresentation:
         return len(self._grid)
 
     @property
+    def f(self) -> torch.Tensor:
+        """Returns the level set function."""
+        return self._level_set_function
+
+    @property
     def grid_tensor(self) -> torch.Tensor:
         """Returns the meshgrid as a single torch tensor."""
         return torch.stack(self._grid, dim=-1)
