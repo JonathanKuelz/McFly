@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from __future__ import annotations
+
 from typing import Callable, Optional, Sequence, Union
 
 import numpy as np
@@ -86,6 +87,12 @@ class LevelSetRepresentation:
         """Returns the spacing of the grid."""
         return torch.stack((self._grid[0][:, 0, 0], self._grid[1][0, :, 0], self._grid[2][0, 0, :]), dim=0)
 
+    def copy(self) -> LevelSetRepresentation:
+        """Returns a copy of the level set representation."""
+        return LevelSetRepresentation(tuple(t.clone() for t in self._grid),
+                                      self._level_set_function.clone(),
+                                      default_level=self._default_level)
+
     def evolve(self,
                v: Union[Callable[[torch.Tensor], torch.Tensor], torch.Tensor],
                dt: float = 1.0,
@@ -144,6 +151,44 @@ class LevelSetRepresentation:
             eps_sign = max(dx, dy, dz) / 20  # Should result in the surface being ~2 cells wide
         signum = self._level_set_function / torch.sqrt(self._level_set_function ** 2 + eps_sign ** 2)
         return sum(g.abs() for g in torch.gradient(signum)) / 3
+
+    def visualize(self,
+                  v: Optional[torch.Tensor] = None,
+                  level: Optional[float] = None,
+                  min_abs_magnitude: float = 0.0,
+                  mesh_kwargs: Optional[dict] = None,
+                  point_kwargs: Optional[dict] = None,
+                  ):
+        """Creates a mesh of the current level set, optionally together with the magnitude of expected change given
+        a velocity field."""
+        import pyvista as pv
+        if point_kwargs is None:
+            point_kwargs = {}
+        point_kwargs.setdefault('opacity', 0.1)
+        point_kwargs.setdefault('show_scalar_bar', False)
+        if mesh_kwargs is None:
+            mesh_kwargs = {}
+        mesh_kwargs.setdefault('opacity', 0.9)
+        mesh_kwargs.setdefault('show_edges', True)
+        mesh_kwargs.setdefault('color', 'white')
+
+        tm = self.get_trimesh(level)
+        pv_mesh = pv.wrap(tm)
+
+        plotter = pv.Plotter()
+        plotter.add_axes()
+        plotter.add_axes_at_origin()
+        plotter.add_mesh(pv_mesh, **mesh_kwargs)
+        if v is not None:
+            magnitude = torch.einsum('ijkl,ijkl->ijk', v, self.normals)
+            mask = torch.abs(magnitude) >= min_abs_magnitude
+            magnitude = magnitude[mask].detach().cpu().numpy().reshape(-1, 1)
+            grid = self.grid_tensor[mask].detach().cpu().numpy().reshape(-1, 3)
+
+            pos = (magnitude >= 0).squeeze()
+            plotter.add_points(grid[pos], scalars=magnitude[pos], cmap="Greens", **point_kwargs)
+            plotter.add_points(grid[~pos], scalars=magnitude[~pos], cmap="Reds", **point_kwargs)
+        plotter.show()
 
     def _check_sanity(self):
         """Checks the sanity of the level set function, the provided dimensions etc."""

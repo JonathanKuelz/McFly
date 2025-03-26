@@ -10,6 +10,7 @@ from curobo.geom.transform import pose_inverse, pose_to_matrix
 from curobo.geom.types import Mesh, WorldConfig
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
+from curobo.util.logger import setup_curobo_logger
 import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
@@ -484,6 +485,10 @@ class BoundedSdf(Sdf, ABC):
         center = self.get_center() if center is None else center
         dims = self.get_dims() if dims is None else dims
         return super().reconstruct_surface_poisson(center, dims, refinement_steps, fix_mesh, limit_to)
+
+
+setup_curobo_logger('warning')
+
 
 class CuroboMeshSdf(BoundedSdf):
     """A signed distance function representing a curobo mesh."""
