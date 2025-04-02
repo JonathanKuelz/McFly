@@ -6,6 +6,7 @@ import numpy as np
 import skfmm
 from skimage.measure import marching_cubes
 import torch
+from torch.distributions.multivariate_normal import MultivariateNormal
 from trimesh import Trimesh
 
 
@@ -92,6 +93,42 @@ class LevelSetRepresentation:
         return LevelSetRepresentation(tuple(t.clone() for t in self._grid),
                                       self._level_set_function.clone(),
                                       default_level=self._default_level)
+
+    @torch.no_grad()
+    def compute_mesh_velocity_field(self,
+                                    mesh_gradients: torch.Tensor,
+                                    mesh_points: torch.Tensor,
+                                    variance: Optional[float] = None):
+        """
+        Every mesh point with a gradient defines a gaussian distribution. The velocity field is the sum of the
+        distributions at all grid points.
+
+        Note: The current implementation is inefficient. FFT and other methods used for Gaussian Splatting could be used.
+
+        :param mesh_gradients: The gradients of the mesh points. Should be of shape (N, 3).
+        :param mesh_points: The mesh points. Should be of shape (N, 3).
+        :param variance: Variance of the Gaussian distribution. If None, it is computed such that approximately 95% of
+            the mesh point gradient is distributed within the closest X grid points in each dimension and direction (so,
+            within a cube of 2X grid points).
+        """
+        nonzero_grad = (mesh_gradients != 0).all(dim=1)
+        if not nonzero_grad.any():
+            print("WARNING: NO CONTACT")
+            return
+
+        if variance is None:
+            dx, dy, dz = map(lambda x: x.item(), self.spacing[:, 1] - self.spacing[:, 0])
+            variance = (3. * min(dx, dy, dz) / 2.45) ** 2
+
+        p = mesh_points[nonzero_grad]
+        grad = mesh_gradients[nonzero_grad]
+
+        gaussian = MultivariateNormal(loc=p, covariance_matrix=torch.eye(3) * variance)
+        density = torch.exp(gaussian.log_prob(self.grid_tensor.view(-1, 1, 3)))
+        density = density / density.norm(dim=0, keepdim=True)  # Normalize it, because CDF != discrete probability
+
+        v = -torch.einsum('ij,jk->ijk', density, grad[nonzero_grad]).sum(dim=1).view(self.normals.shape)
+        return v / torch.linalg.norm(v, dim=-1).max()
 
     def evolve(self,
                v: Union[Callable[[torch.Tensor], torch.Tensor], torch.Tensor],

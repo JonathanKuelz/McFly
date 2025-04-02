@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from itertools import chain
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 from curobo.geom.sdf.world import CollisionCheckerType, WorldCollisionConfig
@@ -14,7 +13,6 @@ from curobo.util.logger import setup_curobo_logger
 import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
-from pyglet.shapes import vertex_source
 import pymeshfix
 import pyvista as pv
 import torch
