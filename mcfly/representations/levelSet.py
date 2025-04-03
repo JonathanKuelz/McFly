@@ -3,11 +3,15 @@ from __future__ import annotations
 from typing import Callable, Optional, Sequence, Union
 
 import numpy as np
+import pyacvd
+import pyvista as pv
 import skfmm
 from skimage.measure import marching_cubes
 import torch
 from torch.distributions.multivariate_normal import MultivariateNormal
 from trimesh import Trimesh
+
+from docbrown.utilities.geometry import pv_to_trimesh
 
 
 class LevelSetRepresentation:
@@ -98,15 +102,19 @@ class LevelSetRepresentation:
     def compute_mesh_velocity_field(self,
                                     mesh_gradients: torch.Tensor,
                                     mesh_points: torch.Tensor,
+                                    max_batch_size: int = 256,
                                     variance: Optional[float] = None):
         """
         Every mesh point with a gradient defines a gaussian distribution. The velocity field is the sum of the
         distributions at all grid points.
 
-        Note: The current implementation is inefficient. FFT and other methods used for Gaussian Splatting could be used.
+        Note: The current implementation is inefficient. FFT could be used, but seems to suffer from numerical issues.
+            Maybe, even a gaussian splatting to the implicit surface could be done, but this requires some engineering.
 
         :param mesh_gradients: The gradients of the mesh points. Should be of shape (N, 3).
         :param mesh_points: The mesh points. Should be of shape (N, 3).
+        :param max_batch_size: The maximum number of gradients/points to process at once. Note that for a grid
+            resolution of 100, a single point already takes up around 5MB of GPU memory.
         :param variance: Variance of the Gaussian distribution. If None, it is computed such that approximately 95% of
             the mesh point gradient is distributed within the closest X grid points in each dimension and direction (so,
             within a cube of 2X grid points).
@@ -123,12 +131,42 @@ class LevelSetRepresentation:
         p = mesh_points[nonzero_grad]
         grad = mesh_gradients[nonzero_grad]
 
-        gaussian = MultivariateNormal(loc=p, covariance_matrix=torch.eye(3) * variance)
-        density = torch.exp(gaussian.log_prob(self.grid_tensor.view(-1, 1, 3)))
-        density = density / density.norm(dim=0, keepdim=True)  # Normalize it, because CDF != discrete probability
-
-        v = -torch.einsum('ij,jk->ijk', density, grad[nonzero_grad]).sum(dim=1).view(self.normals.shape)
+        v = torch.zeros_like(self.normals)
+        batch_indices = torch.arange(p.shape[0], device=p.device).split(max_batch_size)
+        for idx in batch_indices:
+            gaussian = MultivariateNormal(loc=p[idx], covariance_matrix=torch.eye(3) * variance)
+            density = torch.exp(gaussian.log_prob(self.grid_tensor.view(-1, 1, 3)))
+            density = density / density.norm(dim=0, keepdim=True)  # Normalize it, because CDF != discrete probability
+            v += torch.einsum('ij,jk->ijk', density, grad[nonzero_grad][idx]).sum(dim=1).view(self.normals.shape)
         return v / torch.linalg.norm(v, dim=-1).max()
+
+    def _get_gradients_impulse_grid(self, p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+        """
+        This function takes a tensor of Nx3 gradient vectors (i.e., a sparse velocity field) and returns the dense
+        impulse grid (i.e., a step size field with zeros everywhere except at the grid points).
+
+        In contrast to other methods, the points p do not need to be on the grid exactly. This function will find the
+        closest grid point automatically and apply them there.
+
+        Usage:
+        gaussian_impulse = self._get_gradients_impulse_grid(p, grad)
+        mag_v = normal_distribution_density_fourier(self.grid_tensor, gaussian_impulse, variance)
+
+        :param p: The grid points where the impulse is defined. Should be of shape (N, 3).
+        :return:
+        """
+        # Convert centers to integer grid indices
+        x = self.grid_tensor[:, 0, 0, 0]
+        y = self.grid_tensor[0, :, 0, 1]
+        z = self.grid_tensor[0, 0, :, 2]
+
+
+        # Create impulse function at the Gaussian centers
+        indices = (torch.stack([x, y, z], dim=-1).unsqueeze(1) - p.unsqueeze(0)).abs().argmin(dim=0)
+        grad_grid = torch.zeros_like(self.grid_tensor)
+        grad_grid[indices[:, 0], indices[:, 1], indices[:, 2]] = grad
+        impulse = torch.einsum('ijkl,ijkl->ijk', grad_grid, self.normals)
+        return impulse
 
     def evolve(self,
                v: Union[Callable[[torch.Tensor], torch.Tensor], torch.Tensor],
@@ -164,10 +202,19 @@ class LevelSetRepresentation:
         verts = verts + np.array([self._grid[0].min().item(), self._grid[1].min().item(), self._grid[2].min().item()])
         return verts, faces, normals, values
 
-    def get_trimesh(self, level: Optional[float] = None) -> Trimesh:
+    def get_trimesh(self, level: Optional[float] = None, max_num_vertices: Optional[int] = None) -> Trimesh:
         """Returns the mesh data as a trimesh object."""
         verts, faces, normals, values = self.get_mesh_data(level)
-        return Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
+        tm = Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
+        if max_num_vertices is None:
+            return tm
+        pvm = pv.wrap(tm)
+
+        pyacvd.clustering.LOG.setLevel(0)  # Suppress pyacvd logging
+        clus = pyacvd.Clustering(pvm)
+        clus.cluster(max_num_vertices)  # Using clus.subdivide() before this might help if the initial mesh is coarse
+        remeshed = clus.create_mesh()  # Could also use the .decimate() method to reduce the number of vertices again
+        return pv_to_trimesh(remeshed)
 
     def reinitialize(self):
         """Reinitializes the level set function using the fast marching method."""
@@ -223,8 +270,10 @@ class LevelSetRepresentation:
             grid = self.grid_tensor[mask].detach().cpu().numpy().reshape(-1, 3)
 
             pos = (magnitude >= 0).squeeze()
-            plotter.add_points(grid[pos], scalars=magnitude[pos], cmap="Greens", **point_kwargs)
-            plotter.add_points(grid[~pos], scalars=magnitude[~pos], cmap="Reds", **point_kwargs)
+            if pos.any():
+                plotter.add_points(grid[pos], scalars=magnitude[pos], cmap="Greens", **point_kwargs)
+            if not pos.all():
+                plotter.add_points(grid[~pos], scalars=magnitude[~pos], cmap="Reds", **point_kwargs)
         plotter.show()
 
     def _check_sanity(self):
